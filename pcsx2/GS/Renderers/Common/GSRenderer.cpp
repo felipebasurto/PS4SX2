@@ -162,18 +162,38 @@ static std::mutex s_orbis_helper_mutex;
 static pthread_t s_orbis_helpers[8];
 static int s_orbis_helper_n = 0;
 static unsigned long long s_orbis_helper_mask = 0;
-static int OrbisPinHelpersLocked()
+static unsigned long long OrbisPthreadId(pthread_t thread)
+{
+	unsigned long long id = 0;
+	memcpy(&id, &thread, sizeof(thread) < sizeof(id) ? sizeof(thread) : sizeof(id));
+	return id;
+}
+static int OrbisPinHelpersLocked(int* rcs)
 {
 	int failed = 0;
 	for (int i = 0; i < s_orbis_helper_n; i++)
-		failed += scePthreadSetaffinity(s_orbis_helpers[i], s_orbis_helper_mask) != 0 ? 1 : 0;
+	{
+		const int rc = scePthreadSetaffinity(s_orbis_helpers[i], s_orbis_helper_mask);
+		if (rcs)
+			rcs[i] = rc;
+		failed += rc != 0 ? 1 : 0;
+	}
 	return failed;
 }
 static void OrbisPinHelpers(unsigned long long mask)
 {
 	std::lock_guard<std::mutex> lock(s_orbis_helper_mutex);
 	s_orbis_helper_mask = mask;
-	const int failed = OrbisPinHelpersLocked();
+	int rcs[std::size(s_orbis_helpers)] = {};
+	const int failed = OrbisPinHelpersLocked(rcs);
+	for (int i = 0; i < s_orbis_helper_n; i++)
+	{
+		if (rcs[i] != 0)
+		{
+			printf("[pin] helper %d (%#llx) to %#llx failed rc=%d\n", i, OrbisPthreadId(s_orbis_helpers[i]), mask,
+				rcs[i]);
+		}
+	}
 	printf("[pin] helpers: %d thread(s) to %#llx%s\n", s_orbis_helper_n, mask, failed ? " (some failed)" : "");
 }
 void OrbisHelperThreadAdd(pthread_t thread)
@@ -181,8 +201,14 @@ void OrbisHelperThreadAdd(pthread_t thread)
 	std::lock_guard<std::mutex> lock(s_orbis_helper_mutex);
 	if (s_orbis_helper_n < static_cast<int>(std::size(s_orbis_helpers)))
 		s_orbis_helpers[s_orbis_helper_n++] = thread;
+	else
+		printf("[pin] helper (%#llx) not registered: helper list full\n", OrbisPthreadId(thread));
 	if (s_orbis_helper_mask != 0)
-		scePthreadSetaffinity(thread, s_orbis_helper_mask);
+	{
+		const int rc = scePthreadSetaffinity(thread, s_orbis_helper_mask);
+		if (rc != 0)
+			printf("[pin] new helper (%#llx) to %#llx failed rc=%d\n", OrbisPthreadId(thread), s_orbis_helper_mask, rc);
+	}
 }
 void OrbisHelperThreadRemove(pthread_t thread)
 {
@@ -235,9 +261,96 @@ static void OrbisTickerWatch()
 	printf("[ticker] no pass for %.1f s: in step %s, last on CPU %d; moved to %#llx (rc=%d)\n", stale_s,
 		(step >= 0 && step < 5) ? steps[step] : "?", cpu, mask, rc);
 }
+#ifdef ORBIS_PS4
+// PS4 port (AI-assisted): Jaguar has no SMT, so every bit of the process mask is an independent core. The two
+// four-core modules are CPUs 0-3 and 4-7; pick EE and VU from one module and GS from the other when the mask
+// allows it, without assuming any particular CPU is usable.
+static int OrbisMaskCpuList(unsigned long long mask, int* cpus, int max_cpus)
+{
+	int n = 0;
+	for (int c = 0; c < 64 && n < max_cpus; c++)
+	{
+		if ((mask & (1ull << c)) != 0)
+			cpus[n++] = c;
+	}
+	return n;
+}
+static int OrbisMaskSingleCpu(unsigned long long mask)
+{
+	if (mask == 0 || (mask & (mask - 1)) != 0)
+		return -1;
+	for (int c = 0; c < 64; c++)
+	{
+		if ((mask & (1ull << c)) != 0)
+			return c;
+	}
+	return -1;
+}
+static void OrbisPs4ChooseMainCpus(unsigned long long mask, int* ee_cpu, int* gs_cpu, int* vu_cpu)
+{
+	int cpus[64];
+	const int ncpus = OrbisMaskCpuList(mask, cpus, static_cast<int>(std::size(cpus)));
+	int cluster_cpus[2][64];
+	int cluster_n[2] = {0, 0};
+	for (int i = 0; i < ncpus; i++)
+	{
+		const int cluster = (cpus[i] / 4) & 1;
+		cluster_cpus[cluster][cluster_n[cluster]++] = cpus[i];
+	}
+	*ee_cpu = -1;
+	*gs_cpu = -1;
+	*vu_cpu = -1;
+	int primary = -1;
+	if (cluster_n[0] >= 2 && (cluster_n[0] >= cluster_n[1] || cluster_n[1] < 2))
+		primary = 0;
+	else if (cluster_n[1] >= 2)
+		primary = 1;
+	if (primary >= 0)
+	{
+		const int secondary = primary ^ 1;
+		*ee_cpu = cluster_cpus[primary][0];
+		*vu_cpu = cluster_cpus[primary][1];
+		if (cluster_n[secondary] != 0)
+			*gs_cpu = cluster_cpus[secondary][0];
+		else if (cluster_n[primary] >= 3)
+			*gs_cpu = cluster_cpus[primary][2];
+	}
+	if (*ee_cpu < 0 || *gs_cpu < 0 || *vu_cpu < 0)
+	{
+		// Very small or scattered mask: use distinct CPUs in mask order where there are enough of them.
+		*ee_cpu = ncpus != 0 ? cpus[0] : -1;
+		*gs_cpu = ncpus >= 2 ? cpus[1] : *ee_cpu;
+		*vu_cpu = ncpus >= 3 ? cpus[2] : *ee_cpu;
+	}
+}
+static unsigned long long OrbisPs4WorkerMask(unsigned long long rest, int slot)
+{
+	int cpus[64];
+	const int ncpus = OrbisMaskCpuList(rest, cpus, static_cast<int>(std::size(cpus)));
+	if (ncpus == 0)
+		return rest;
+	return 1ull << cpus[(slot - 3) % ncpus];
+}
+static void OrbisPs4LogSlots(const unsigned long long* slot_mask, const int* rc, unsigned long long rest)
+{
+	static const char* const names[ORBIS_CPU_SLOTS] = {"ee", "gs", "vu", "sw0", "sw1", "sw2", "sw3", "sw4"};
+	printf("[pin] rest=%#llx\n", rest);
+	for (int i = 0; i < ORBIS_CPU_SLOTS; i++)
+	{
+		const int cpu = OrbisMaskSingleCpu(slot_mask[i]);
+		char cpu_text[16];
+		if (cpu >= 0)
+			snprintf(cpu_text, sizeof(cpu_text), "%d", cpu);
+		else
+			snprintf(cpu_text, sizeof(cpu_text), "multi");
+		printf("[pin] slot %s cpu=%s mask=%#llx rc=%d\n", names[i], cpu_text, slot_mask[i], rc[i]);
+	}
+}
+#endif
+
 // vk-285-87: pin=3, the explicit layout (s_orbis_pin_cpu). A named CPU outside the process mask counts as
-// unnamed. The EE's and the VU's SMT siblings are left free as well, so those two threads have their cores
-// alone; every unnamed thread gets the CPUs left over.
+// unnamed. On the PS5 the EE's and the VU's SMT siblings are left free as well, so those two threads have their
+// cores alone; the PS4's Jaguar cores have no SMT siblings. Every unnamed thread gets the CPUs left over.
 static void OrbisApplyLayout(unsigned long long orig)
 {
 	int cpu[ORBIS_PIN_COUNT];
@@ -250,10 +363,14 @@ static void OrbisApplyLayout(unsigned long long orig)
 		if (cpu[i] >= 0)
 			reserved |= 1ull << cpu[i];
 	}
+#ifndef ORBIS_PS4
 	if (cpu[ORBIS_PIN_EE] >= 0)
 		reserved |= 1ull << (cpu[ORBIS_PIN_EE] ^ 1);
 	if (cpu[ORBIS_PIN_VU] >= 0)
 		reserved |= 1ull << (cpu[ORBIS_PIN_VU] ^ 1);
+#else
+	// PS4 port (AI-assisted): no sibling reservation on Jaguar; each logical CPU is a whole core.
+#endif
 	unsigned long long rest = orig & ~reserved;
 	if (rest == 0)
 		rest = orig;
@@ -262,6 +379,12 @@ static void OrbisApplyLayout(unsigned long long orig)
 	int rc_all = 1;
 	if (s_orbis_pin_all.load(std::memory_order_acquire))
 	{
+#ifdef ORBIS_PS4
+		// PS4 port (AI-assisted): ps4_compat's cpuset_setaffinity is ENOSYS. Known threads are pinned one by
+		// one below; threads the port never registered keep whatever mask they inherited. Needs proper testing.
+		rc_all = ENOSYS;
+		printf("[pin] pin_all: process-wide affinity unsupported on PS4; pinning known threads individually\n");
+#else
 		cpuset_t set;
 		CPU_ZERO(&set);
 		for (int c = 0; c < 64; c++)
@@ -275,14 +398,21 @@ static void OrbisApplyLayout(unsigned long long orig)
 			if (rc_all != ERANGE)
 				break;
 		}
+#endif
 	}
 	s_orbis_pin_mode = 3;
 	int rc[ORBIS_CPU_SLOTS];
+	unsigned long long slot_mask[ORBIS_CPU_SLOTS];
+#ifdef ORBIS_PS4
+	const int missing_rc = -1;
+#else
+	const int missing_rc = 1;
+#endif
 	for (int i = 0; i < ORBIS_CPU_SLOTS; i++)
 	{
-		const unsigned long long m = (i == 0) ? mask_of(ORBIS_PIN_EE) : (i == 1) ? mask_of(ORBIS_PIN_GS) :
+		slot_mask[i] = (i == 0) ? mask_of(ORBIS_PIN_EE) : (i == 1) ? mask_of(ORBIS_PIN_GS) :
 			(i == 2) ? mask_of(ORBIS_PIN_VU) : rest;
-		rc[i] = (s_orbis_thr[i] != pthread_t{}) ? scePthreadSetaffinity(s_orbis_thr[i], m) : 1;
+		rc[i] = (s_orbis_thr[i] != pthread_t{}) ? scePthreadSetaffinity(s_orbis_thr[i], slot_mask[i]) : missing_rc;
 	}
 	int rc_rec = 1, rc_queue = 1;
 #ifdef ORBIS_VULKAN
@@ -302,10 +432,75 @@ static void OrbisApplyLayout(unsigned long long orig)
 	printf("[pin] mode=3 ee=%d gs=%d vu=%d rec=%d queue=%d rest=%#llx all=%d rc ee=%d gs=%d vu=%d rec=%d queue=%d\n",
 		cpu[ORBIS_PIN_EE], cpu[ORBIS_PIN_GS], cpu[ORBIS_PIN_VU], cpu[ORBIS_PIN_REC], cpu[ORBIS_PIN_QUEUE], rest,
 		rc_all, rc[0], rc[1], rc[2], rc_rec, rc_queue);
+#ifdef ORBIS_PS4
+	OrbisPs4LogSlots(slot_mask, rc, rest);
+#endif
 	OrbisPinHelpers(rest); // vk-285-108
 	fflush(stdout);
 	OrbisOSDLabel("PIN 3");
 }
+
+#ifdef ORBIS_PS4
+// PS4 port (AI-assisted): automatic pinning for Jaguar. Modes 1 and 2 both put EE, GS and VU on distinct cores
+// when the process mask has enough cores; mode 2 also spreads the software workers round-robin over the cores
+// left for them. Needs proper testing on both seven-core masks and unusual partial masks.
+static void OrbisApplyPinningPs4(int mode, unsigned long long orig)
+{
+	unsigned long long ee = orig, gs = orig, vu = orig, rest = orig;
+	unsigned long long slot_mask[ORBIS_CPU_SLOTS];
+	for (int i = 0; i < ORBIS_CPU_SLOTS; i++)
+		slot_mask[i] = orig;
+	int ee_cpu = -1, gs_cpu = -1, vu_cpu = -1;
+	if (mode >= 1)
+	{
+		OrbisPs4ChooseMainCpus(orig, &ee_cpu, &gs_cpu, &vu_cpu);
+		if (ee_cpu >= 0 && gs_cpu >= 0 && vu_cpu >= 0)
+		{
+			ee = 1ull << ee_cpu;
+			gs = 1ull << gs_cpu;
+			vu = 1ull << vu_cpu;
+			rest = orig & ~(ee | gs | vu);
+			if (rest == 0)
+				rest = orig & ~ee; // too few cores: keep the EE alone and let the helpers share GS/VU
+			if (rest == 0)
+				rest = orig;
+			slot_mask[0] = ee;
+			slot_mask[1] = gs;
+			slot_mask[2] = vu;
+			for (int i = 3; i < ORBIS_CPU_SLOTS; i++)
+				slot_mask[i] = (mode >= 2) ? OrbisPs4WorkerMask(rest, i) : rest;
+		}
+	}
+	const unsigned long long helper_mask = (mode >= 1) ? rest : orig;
+	s_orbis_pin_mode = mode;
+	int rc[ORBIS_CPU_SLOTS];
+	for (int i = 0; i < ORBIS_CPU_SLOTS; i++)
+		rc[i] = (s_orbis_thr[i] != pthread_t{}) ? scePthreadSetaffinity(s_orbis_thr[i], slot_mask[i]) : -1;
+	int rc_rec = -1, rc_queue = -1;
+#ifdef ORBIS_VULKAN
+	if (ps5vk_debug_threads)
+	{
+		if (void* const device = OrbisVkDeviceHandle())
+		{
+			pthread_t recorder{}, queue{};
+			const uint32_t found = ps5vk_debug_threads(device, &recorder, &queue);
+			if (found & 1u)
+				rc_rec = scePthreadSetaffinity(recorder, helper_mask);
+			if (found & 2u)
+				rc_queue = scePthreadSetaffinity(queue, helper_mask);
+		}
+	}
+#endif
+	printf("[pin] mode=%d ee_cpu=%d gs_cpu=%d vu_cpu=%d rest=%#llx rc ee=%d gs=%d vu=%d rec=%d queue=%d\n", mode,
+		ee_cpu, gs_cpu, vu_cpu, rest, rc[0], rc[1], rc[2], rc_rec, rc_queue);
+	OrbisPs4LogSlots(slot_mask, rc, helper_mask);
+	OrbisPinHelpers(helper_mask);
+	fflush(stdout);
+	char label[24];
+	snprintf(label, sizeof(label), "PIN %d", mode);
+	OrbisOSDLabel(label);
+}
+#endif
 
 // CPU thread (Host::PumpMessagesOnCPUThread). SMT siblings are taken to be CPUs 2k and 2k+1.
 void OrbisApplyPinning(int mode)
@@ -326,18 +521,24 @@ void OrbisApplyPinning(int mode)
 		}
 		s_orig = m;
 	}
+#ifndef ORBIS_PS4
 	int pairs[8], np = 0;
 	for (int k = 7; k >= 0; k--)
 		if (((s_orig >> (2 * k)) & 3ull) == 3ull)
 			pairs[np++] = k;
 	if (np < 3 && mode != 3)
 		mode = 0;
-	unsigned long long ee = s_orig, gs = s_orig, rest = s_orig;
+#endif
 	if (mode == 3)
 	{
 		OrbisApplyLayout(s_orig);
 		return;
 	}
+#ifdef ORBIS_PS4
+	OrbisApplyPinningPs4(mode, s_orig);
+	return;
+#else
+	unsigned long long ee = s_orig, gs = s_orig, rest = s_orig;
 	if (mode >= 1)
 	{
 		ee = 1ull << (2 * pairs[0]);
@@ -363,6 +564,7 @@ void OrbisApplyPinning(int mode)
 	char label[24];
 	snprintf(label, sizeof(label), "PIN %d", mode);
 	OrbisOSDLabel(label);
+#endif
 }
 // Appended to the [load] line: each thread's two most frequent CPUs and their share of the samples.
 static void OrbisPrintCpu()
