@@ -23,8 +23,13 @@ class VU_Thread final {
 	// Note: keep atomic on separate cache line to avoid CPU conflict
 	alignas(__cachelinesize) std::atomic<int> m_ato_read_pos; // Only modified by VU thread
 	alignas(__cachelinesize) std::atomic<int> m_ato_write_pos;    // Only modified by EE thread
+	// PS4 port (AI-assisted): the producer's cumulative words on the producer index's line. The VU
+	// thread already fetches that line for the position, so the ring high-water mark costs no extra
+	// cross-core line. Telemetry only; the ring protocol still uses the positions.
+	std::atomic<u64> m_ato_write_words{0};
 	alignas(__cachelinesize) int  m_read_pos; // temporary read pos (local to the VU thread)
 	u32  m_orbis_rlaps = 0; // vk-285-93: MTVU_NULL_PACKETs the VU thread followed (VU thread only)
+	u64  m_orbis_read_lap_base = 0; // PS4 port (AI-assisted): words consumed before this lap (VU thread only)
 	// PS5 port (vk-285-10): each thread's position, and the semaphore both threads update on every
 	// packet, get their own cache line. Sharing one, every EE write of m_write_pos and every VU-thread
 	// write of m_read_pos or the semaphore state pulled the line across cores: the first load in
@@ -58,15 +63,20 @@ class VU_Thread final {
 	//   the lap's first packet (OrbisWaitLapStart). Cumulative.
 	u64  m_orbis_wraps = 0;
 	u64  m_orbis_lap_waits = 0;
+	// PS4 port (AI-assisted): cumulative words written before this lap, published with the write position
+	// for the consumer-side high-water mark. EE thread only, on its own line with the state above.
+	u64  m_orbis_write_lap_base = 0;
 	alignas(__cachelinesize) Threading::WorkSema semaEvent;
-	std::atomic_bool m_shutdown_flag{false};
+	alignas(__cachelinesize) std::atomic_bool m_shutdown_flag{false};
 
 	Threading::Thread m_thread;
 
 public:
 	alignas(16)  vifStruct        vif;
 	alignas(16)  VIFregisters     vifRegs;
-	Threading::UserspaceSemaphore semaXGkick;
+	// PS4 port (AI-assisted): the XGKICK semaphore is posted by the VU thread and polled/waited by the
+	// GS thread. Keep it out of the VIF state lines (hot on the VU thread), as the ring indices already are.
+	alignas(__cachelinesize) Threading::UserspaceSemaphore semaXGkick;
 	alignas(__cachelinesize) std::atomic<unsigned int> vuCycles[4]; // Used for VU cycle stealing hack (own line: the VU thread writes it per program)
 	u32 vuCycleIdx;  // Used for VU cycle stealing hack
 	u32 vuFBRST;
@@ -80,8 +90,10 @@ public:
 	};
 
 	alignas(__cachelinesize) std::atomic<u32> mtvuInterrupts; // Used for GS Signal, Finish etc, plus VU End/T-Bit (own line: the EE polls it)
-	std::atomic<u64> gsLabel; // Used for GS Label command
-	std::atomic<u64> gsSignal; // Used for GS Signal command
+	// PS4 port (AI-assisted): the interrupt flag is polled/cleared by the EE thread while these payloads
+	// are written by the VU thread. Separate lines keep an occasional SIGNAL/LABEL from moving the flag's line.
+	alignas(__cachelinesize) std::atomic<u64> gsLabel; // Used for GS Label command
+	alignas(__cachelinesize) std::atomic<u64> gsSignal; // Used for GS Signal command
 
 	VU_Thread();
 	~VU_Thread();
@@ -153,6 +165,7 @@ private:
 	void WaitOnSize(s32 size);
 	void ReserveSpace(s32 size);
 	void OrbisWaitLapStart(s32 null_pos); // vk-285-93
+	void OrbisRingHighWater(); // PS4 port (AI-assisted): consumer-side backlog telemetry
 	[[noreturn]] void OrbisBadCommand(u32 tag); // vk-285-93
 
 	s32 GetReadPos();
@@ -173,5 +186,18 @@ private:
 
 	u32 Get_vuCycles();
 };
+
+// PS4 port (AI-assisted): MTVU ring telemetry, each counter written by only one side (EE or VU) and
+// read/reset by the GS thread's once-a-second stats. spin_waits/sleep_waits count which wait path the
+// VU thread entered; WorkSema does not report whether a spin wait timed out before sleeping.
+extern std::atomic<u64> g_orbis_mtvu_kicks;
+extern std::atomic<u64> g_orbis_mtvu_kick_coalesced;
+extern std::atomic<u64> g_orbis_mtvu_ring_stalls;
+extern std::atomic<u64> g_orbis_mtvu_laps;
+extern std::atomic<u64> g_orbis_mtvu_vu_laps;
+extern std::atomic<u64> g_orbis_mtvu_vu_wakeups;
+extern std::atomic<u64> g_orbis_mtvu_vu_spin_waits;
+extern std::atomic<u64> g_orbis_mtvu_vu_sleep_waits;
+extern std::atomic<u32> g_orbis_mtvu_ring_hwm_kb;
 
 extern VU_Thread vu1Thread;

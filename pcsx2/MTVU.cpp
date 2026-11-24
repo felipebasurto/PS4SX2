@@ -56,6 +56,24 @@ std::atomic<int> g_orbis_mtvu_batch{0};
 // 16384 (the whole 16 MB buffer, as before) by default. A shorter lap keeps the lines the EE thread writes
 // in the caches (a 16 MB lap comes back to lines long gone to memory). 256..16384. Needs proper testing.
 std::atomic<u32> g_orbis_mtvu_ring_kb{16384};
+// PS4 port (AI-assisted): ring telemetry for the once-a-second GS line. Each counter has one writer;
+// the load+store increments below are deliberate (a locked add per kick would cost more than the event
+// being counted). The writer/reader lines are separate so the telemetry itself does not add sharing.
+alignas(__cachelinesize) std::atomic<u64> g_orbis_mtvu_kicks{0}; // EE: KickStart calls
+alignas(__cachelinesize) std::atomic<u64> g_orbis_mtvu_kick_coalesced{0}; // EE: repeat wait-loop kicks suppressed
+alignas(__cachelinesize) std::atomic<u64> g_orbis_mtvu_ring_stalls{0}; // EE: WaitOnSize calls that reached the wait loop
+alignas(__cachelinesize) std::atomic<u64> g_orbis_mtvu_laps{0}; // EE: NULL packets written/ring wraps
+alignas(__cachelinesize) std::atomic<u64> g_orbis_mtvu_vu_laps{0}; // VU: NULL packets followed
+alignas(__cachelinesize) std::atomic<u64> g_orbis_mtvu_vu_wakeups{0}; // VU: work waits returned
+alignas(__cachelinesize) std::atomic<u64> g_orbis_mtvu_vu_spin_waits{0}; // VU: spin-path waits entered (not timeout outcomes)
+alignas(__cachelinesize) std::atomic<u64> g_orbis_mtvu_vu_sleep_waits{0}; // VU: sleep-path waits entered
+alignas(__cachelinesize) std::atomic<u32> g_orbis_mtvu_ring_hwm_kb{0}; // VU: maximum producer-minus-consumer ring backlog, KiB
+
+static __fi void OrbisMtvuCount(std::atomic<u64>& counter)
+{
+	counter.store(counter.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);
+}
+
 extern std::atomic<u64> g_orbis_ee_evtests; // R5900.cpp
 extern std::atomic<u64> g_orbis_ee_vif1ints; // Vif1_Dma.cpp
 // Cumulative counts: event tests, VIF1 DMA interrupts, MTVU packets through the GIF fast path and through
@@ -223,9 +241,12 @@ void VU_Thread::Reset()
 {
 	vuCycleIdx = 0;
 	m_ato_write_pos = 0;
+	m_ato_write_words = 0;
 	m_write_pos = 0;
 	m_ato_read_pos = 0;
 	m_read_pos = 0;
+	m_orbis_read_lap_base = 0;
+	m_orbis_write_lap_base = 0;
 	m_cached_read_pos = 0; // vk-285-84
 	m_defer_kicks = false;
 	m_kick_pending = false;
@@ -238,6 +259,22 @@ void VU_Thread::Reset()
 	vu1Thread.mtvuInterrupts = 0;
 }
 
+// PS4 port (AI-assisted): the ring backlog in KiB, at a packet boundary on the consumer. Both sides turn
+// their position into cumulative words with a lap base, so laps and live lap-length changes do not make the
+// positions ambiguous for this statistic. Only the VU thread writes the high-water mark; a once-a-second
+// reader may reset it like the other counters.
+void VU_Thread::OrbisRingHighWater()
+{
+	const u64 written = m_ato_write_words.load(std::memory_order_relaxed);
+	const u64 read = m_orbis_read_lap_base + static_cast<u64>(m_read_pos);
+	if (written < read) [[unlikely]]
+		return; // A reset can catch the two counters on opposite sides of zero.
+	const u64 bytes = (written - read) * sizeof(u32);
+	const u32 kb = static_cast<u32>((bytes + 1023) / 1024);
+	if (kb > g_orbis_mtvu_ring_hwm_kb.load(std::memory_order_relaxed))
+		g_orbis_mtvu_ring_hwm_kb.store(kb, std::memory_order_relaxed);
+}
+
 void VU_Thread::ExecuteRingBuffer()
 {
 	Threading::SetNameOfCurrentThread("MTVU");
@@ -248,9 +285,16 @@ void VU_Thread::ExecuteRingBuffer()
 			const unsigned long long t0 = __builtin_ia32_rdtsc(); // eerec-281
 			g_orbis_vu_waiting.store(1, std::memory_order_relaxed); // vk-285-29
 			if (g_orbis_mtvu_spin.load(std::memory_order_relaxed)) // vk-285-84
+			{
+				OrbisMtvuCount(g_orbis_mtvu_vu_spin_waits); // PS4 port (AI-assisted): path entered, not the timeout outcome
 				semaEvent.WaitForWorkWithSpin();
+			}
 			else
+			{
+				OrbisMtvuCount(g_orbis_mtvu_vu_sleep_waits);
 				semaEvent.WaitForWork();
+			}
+			OrbisMtvuCount(g_orbis_mtvu_vu_wakeups); // PS4 port (AI-assisted): a work wait returned
 			g_orbis_vu_waiting.store(0, std::memory_order_relaxed);
 			g_orbis_vu_idle_ticks += __builtin_ia32_rdtsc() - t0;
 			OrbisCpuSample(2); // eerec-285
@@ -261,6 +305,7 @@ void VU_Thread::ExecuteRingBuffer()
 
 		while (m_ato_read_pos.load(std::memory_order_relaxed) != GetWritePos())
 		{
+			OrbisRingHighWater(); // PS4 port (AI-assisted): uses the write-position line this loop already loads
 			u32 tag = Read();
 			switch (tag)
 			{
@@ -423,7 +468,9 @@ void VU_Thread::ExecuteRingBuffer()
 				}
 				case MTVU_NULL_PACKET:
 					m_orbis_rlaps++; // vk-285-93
+					OrbisMtvuCount(g_orbis_mtvu_vu_laps); // PS4 port (AI-assisted)
 					OrbisHist(6, static_cast<u32>(m_read_pos - 1), m_orbis_rlaps, 0, 0);
+					m_orbis_read_lap_base += static_cast<u64>(m_read_pos); // PS4 port (AI-assisted): includes the NULL word
 					m_read_pos = 0;
 					break;
 				default:
@@ -433,6 +480,21 @@ void VU_Thread::ExecuteRingBuffer()
 			}
 
 			CommitReadPos();
+			// PS4 port (AI-assisted): pull the next packet's lines toward the consumer after publishing
+			// this packet's read position. Opt-in with the existing flags/pfw switch; a bad guess only
+			// prefetches ring memory, never changes it. Needs proper testing.
+			if (g_orbis_pfw.load(std::memory_order_relaxed)) [[unlikely]]
+			{
+				constexpr s32 line_words = __cachelinesize / sizeof(u32);
+				static_assert((line_words & (line_words - 1)) == 0);
+				const s32 next_line = (m_read_pos & ~(line_words - 1)) + line_words;
+				for (s32 i = 0; i < 2; i++)
+				{
+					const s32 at = next_line + i * line_words;
+					if (at < buffer_size)
+						__builtin_prefetch(&buffer[at], 0, 3);
+				}
+			}
 		}
 	}
 
@@ -461,6 +523,8 @@ __ri void VU_Thread::WaitOnSize(s32 size)
 	}
 	struct OrbisRingTimer { unsigned long long t0 = __builtin_ia32_rdtsc(); ~OrbisRingTimer() { g_orbis_ee_vuring_ticks += __builtin_ia32_rdtsc() - t0; } } orbis_ring_timer; // eerec-281
 	OrbisEEWaitScope orbis_wait; // vk-285-8
+	OrbisMtvuCount(g_orbis_mtvu_ring_stalls); // PS4 port (AI-assisted)
+	bool kick_sent = false;
 	for (;;)
 	{
 		s32 readPos = GetReadPos();
@@ -475,7 +539,16 @@ __ri void VU_Thread::WaitOnSize(s32 size)
 		if (readPos > m_write_pos + size + _4kb)
 			break; // Enough free front space
 		{          // Let MTVU run to free up buffer space
-			KickStart();
+			// PS4 port (AI-assisted): one kick per wait. This thread cannot add more ring work while it
+			// waits here, so if space is still short the first kick's work is necessarily still unconsumed;
+			// if it was all consumed, the checks above have room and leave. Needs proper testing.
+			if (!kick_sent)
+			{
+				KickStart();
+				kick_sent = true;
+			}
+			else
+				OrbisMtvuCount(g_orbis_mtvu_kick_coalesced);
 			// Locking might trigger a full flush of the ring buffer. Yield
 			// will be more aggressive, and only flush the minimal size.
 			// Performance will be smoother but it will consume extra CPU cycle
@@ -509,9 +582,18 @@ void VU_Thread::OrbisWaitLapStart(s32 null_pos)
 	m_orbis_lap_waits++;
 	struct OrbisRingTimer { unsigned long long t0 = __builtin_ia32_rdtsc(); ~OrbisRingTimer() { g_orbis_ee_vuring_ticks += __builtin_ia32_rdtsc() - t0; } } orbis_ring_timer;
 	OrbisEEWaitScope orbis_wait;
+	bool kick_sent = false;
 	do
 	{
-		KickStart();
+		// PS4 port (AI-assisted): as in WaitOnSize, the waiting EE thread adds no further ring work here;
+		// a still-unmet lap condition means the first kick's work is still ahead of the VU thread. Needs proper testing.
+		if (!kick_sent)
+		{
+			KickStart();
+			kick_sent = true;
+		}
+		else
+			OrbisMtvuCount(g_orbis_mtvu_kick_coalesced);
 		std::this_thread::yield();
 		readPos = GetReadPos();
 	} while (readPos == 0 || readPos > null_pos);
@@ -554,10 +636,12 @@ void VU_Thread::ReserveSpace(s32 size)
 		Write(MTVU_NULL_PACKET);
 		// vk-285-93: not before the VU thread has left this lap's first packet (see OrbisWaitLapStart).
 		OrbisWaitLapStart(m_write_pos - 1);
+		m_orbis_write_lap_base += static_cast<u64>(m_write_pos); // PS4 port (AI-assisted): includes the NULL word
 		// Reset local write pointer/position
 		m_write_pos = 0;
 		CommitWritePos();
 		m_orbis_wraps++;
+		OrbisMtvuCount(g_orbis_mtvu_laps); // PS4 port (AI-assisted)
 		// vk-285-84: a fresh read position for the new lap (the cached one is only ever older).
 		m_cached_read_pos = GetReadPos();
 		// vk-285-90: the next lap's length. The VU thread may still be reading the last lap past a new,
@@ -601,6 +685,8 @@ __fi u32* VU_Thread::GetWritePtr()
 
 __fi void VU_Thread::CommitWritePos()
 {
+	// PS4 port (AI-assisted): telemetry first; the release position store publishes it with the packet.
+	m_ato_write_words.store(m_orbis_write_lap_base + static_cast<u64>(m_write_pos), std::memory_order_relaxed);
 	m_ato_write_pos.store(m_write_pos, std::memory_order_release);
 
 	if (MTVU_ALWAYS_KICK)
@@ -763,6 +849,7 @@ void VU_Thread::KickStart()
 {
 	m_kick_pending = false; // vk-285-84
 	m_orbis_kicks++; // vk-285-90
+	OrbisMtvuCount(g_orbis_mtvu_kicks); // PS4 port (AI-assisted)
 	semaEvent.NotifyOfWork();
 }
 
