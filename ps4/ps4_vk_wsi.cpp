@@ -19,6 +19,7 @@
 #include <orbis/libkernel.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cstdarg>
 #include <cstdint>
 #include <cstdio>
@@ -38,6 +39,23 @@ int ac_ps4_submit_flip(int video, unsigned buffer, unsigned mode, int64_t arg);
 #ifndef ORBIS_VIDEO_OUT_PIXEL_FORMAT_A8R8G8B8_SRGB
 #define ORBIS_VIDEO_OUT_PIXEL_FORMAT_A8R8G8B8_SRGB 0x80000000
 #endif
+
+// Read with ps4_wsi_present_stats (declared again by its users; kept outside the anonymous namespace
+// so the extern "C" accessor has a stable, trivially copyable layout).
+struct Ps4WsiPresentStats
+{
+	uint64_t presents;
+	uint64_t present_failures;
+	uint64_t flip_fallbacks;
+	uint64_t acquire_timeouts;
+	uint64_t acquire_not_ready;
+	uint64_t videoout_register_failures;
+	uint64_t videoout_register_retries;
+	uint64_t videoout_unregister_retries;
+	uint64_t videoout_unregister_retry_failures;
+	uint64_t videoout_unregister_retry_successes;
+	uint64_t videoout_slot_exhausted;
+};
 
 namespace
 {
@@ -59,7 +77,19 @@ std::vector<std::string> s_added_instance_exts, s_added_device_exts;
 
 int s_video = -1;
 OrbisKernelEqueue s_flip_queue;
-int64_t s_flip_arg = 0; // the last flip queued; VideoOut reports the last one shown
+std::atomic<int64_t> s_flip_arg{0}; // the last flip queued; VideoOut reports the last one shown
+
+std::atomic<uint64_t> s_stat_presents{0};
+std::atomic<uint64_t> s_stat_present_failures{0};
+std::atomic<uint64_t> s_stat_flip_fallbacks{0};
+std::atomic<uint64_t> s_stat_acquire_timeouts{0};
+std::atomic<uint64_t> s_stat_acquire_not_ready{0};
+std::atomic<uint64_t> s_stat_register_failures{0};
+std::atomic<uint64_t> s_stat_register_retries{0};
+std::atomic<uint64_t> s_stat_unregister_retries{0};
+std::atomic<uint64_t> s_stat_unregister_retry_failures{0};
+std::atomic<uint64_t> s_stat_unregister_retry_successes{0};
+std::atomic<uint64_t> s_stat_slot_exhausted{0};
 
 struct Surface
 {
@@ -74,7 +104,7 @@ struct Swapchain
 	VkPresentModeKHR present_mode = VK_PRESENT_MODE_FIFO_KHR;
 	VkImage images[kImages] = {};
 	VkDeviceMemory memory[kImages] = {};
-	int64_t shown_by[kImages] = {}; // the flip that last put each image on screen (0: never)
+	int64_t shown_by[kImages] = {}; // the latest flip queued for each image (0: never)
 	uint32_t next = 0;
 	int buffer_set = -1;
 	int first = 0; // its first VideoOut buffer slot (a group of kSlotGroup)
@@ -100,12 +130,15 @@ void RetryRetired()
 {
 	for (size_t i = 0; i < s_retired.size();)
 	{
+		s_stat_unregister_retries.fetch_add(1, std::memory_order_relaxed);
 		const int r = sceVideoOutUnregisterBuffers(s_video, s_retired[i].set);
 		if (r < 0)
 		{
+			s_stat_unregister_retry_failures.fetch_add(1, std::memory_order_relaxed);
 			i++;
 			continue;
 		}
+		s_stat_unregister_retry_successes.fetch_add(1, std::memory_order_relaxed);
 		Log("old buffer set %d (slots %d+) unregistered now", s_retired[i].set, s_retired[i].first);
 		s_group_used[s_retired[i].first / kSlotGroup] = false;
 		s_retired.erase(s_retired.begin() + static_cast<long>(i));
@@ -155,8 +188,17 @@ bool OpenVideoOut()
 		Log("sceVideoOutOpen failed: %#x", static_cast<unsigned>(s_video));
 		return false;
 	}
-	sceKernelCreateEqueue(&s_flip_queue, "pcsx2 flip");
-	sceVideoOutAddFlipEvent(s_flip_queue, s_video, nullptr);
+	int r = sceKernelCreateEqueue(&s_flip_queue, "pcsx2 flip");
+	if (r < 0)
+	{
+		Log("sceKernelCreateEqueue failed: %#x", static_cast<unsigned>(r));
+		sceVideoOutClose(s_video);
+		s_video = -1;
+		return false;
+	}
+	r = sceVideoOutAddFlipEvent(s_flip_queue, s_video, nullptr);
+	if (r < 0)
+		Log("sceVideoOutAddFlipEvent failed: %#x; flip waits will poll at 5 ms", static_cast<unsigned>(r));
 	Log("VideoOut open (handle %d)", s_video);
 	return true;
 }
@@ -165,31 +207,128 @@ int64_t ShownFlip()
 {
 	OrbisVideoOutFlipStatus status = {};
 	if (sceVideoOutGetFlipStatus(s_video, &status) < 0)
-		return s_flip_arg; // can't tell: don't wait forever
+		return -1; // bounded unregister waits must not mistake a queued flip for a shown one
 	return status.flipArg;
+}
+
+// Vulkan timeouts are nanoseconds; sceKernelGetProcessTime and the equeue timeout are microseconds.
+// Saturate the conversion instead of multiplying elapsed time, which can overflow.
+uint64_t FlipWaitDeadline(uint64_t timeout_ns)
+{
+	if (timeout_ns == UINT64_MAX)
+		return UINT64_MAX;
+	const uint64_t timeout_us = timeout_ns / 1000 + (timeout_ns % 1000 != 0 ? 1 : 0);
+	const uint64_t now = sceKernelGetProcessTime();
+	if (timeout_us >= UINT64_MAX - now)
+		return UINT64_MAX;
+	return now + timeout_us;
+}
+
+void WaitFlipEvent(uint64_t deadline)
+{
+	uint64_t wait_us = 5000;
+	if (deadline != UINT64_MAX)
+	{
+		const uint64_t now = sceKernelGetProcessTime();
+		if (now < deadline)
+			wait_us = std::min<uint64_t>(wait_us, deadline - now);
+	}
+	OrbisKernelEvent ev = {};
+	int count = 0;
+	OrbisKernelUseconds timeout = static_cast<OrbisKernelUseconds>(std::max<uint64_t>(wait_us, 1));
+	sceKernelWaitEqueue(s_flip_queue, &ev, 1, &count, &timeout);
 }
 
 // Waits until VideoOut shows flip `arg` or a later one (or until `timeout_ns`).
 bool WaitForFlip(int64_t arg, uint64_t timeout_ns)
 {
-	const uint64_t start = sceKernelGetProcessTime();
+	const uint64_t deadline = FlipWaitDeadline(timeout_ns);
 	while (ShownFlip() < arg)
 	{
-		if (timeout_ns != UINT64_MAX && (sceKernelGetProcessTime() - start) * 1000 >= timeout_ns)
+		if (deadline != UINT64_MAX && sceKernelGetProcessTime() >= deadline)
 			return false;
-		OrbisKernelEvent ev;
-		int count = 0;
-		OrbisKernelUseconds timeout = 5000;
-		sceKernelWaitEqueue(s_flip_queue, &ev, 1, &count, &timeout);
+		WaitFlipEvent(deadline);
 	}
 	return true;
+}
+
+struct FlipSnapshot
+{
+	bool valid = false;
+	int64_t arg = 0;
+	int current_buffer = -1;
+};
+
+FlipSnapshot GetFlipSnapshot()
+{
+	FlipSnapshot snapshot;
+	OrbisVideoOutFlipStatus status = {};
+	if (sceVideoOutGetFlipStatus(s_video, &status) == 0)
+	{
+		snapshot.valid = true;
+		snapshot.arg = status.flipArg;
+		snapshot.current_buffer = status.currentBuffer;
+	}
+	return snapshot;
+}
+
+// An image is reusable once its latest flip reached the screen and VideoOut has since moved to
+// another buffer. currentBuffer is authoritative; waiting for shown_by + 1 alone can leave the
+// round-robin image stuck when no later present ever comes. Never-presented images are free even if
+// the status query fails. Needs proper testing on the console.
+bool ImageAvailable(const Swapchain* sc, uint32_t image, const FlipSnapshot& flip)
+{
+	const int64_t shown = sc->shown_by[image];
+	if (shown == 0)
+		return true;
+	if (!flip.valid || flip.arg < shown)
+		return false;
+	return flip.current_buffer != sc->first + static_cast<int>(image);
+}
+
+// Keep round-robin order as a preference, but take any free image. Strictly waiting on the next one
+// can deadlock after presents stop: one image stays on screen while the others are already reusable.
+bool WaitForImage(Swapchain* sc, uint64_t timeout_ns, uint32_t* index)
+{
+	const uint64_t deadline = FlipWaitDeadline(timeout_ns);
+	for (;;)
+	{
+		const FlipSnapshot flip = GetFlipSnapshot();
+		for (uint32_t offset = 0; offset < kImages; offset++)
+		{
+			const uint32_t image = (sc->next + offset) % kImages;
+			if (!ImageAvailable(sc, image, flip))
+				continue;
+			sc->next = (image + 1) % kImages;
+			*index = image;
+			return true;
+		}
+		if (deadline != UINT64_MAX && sceKernelGetProcessTime() >= deadline)
+			return false;
+		WaitFlipEvent(deadline);
+	}
 }
 
 void ReleaseBuffers(Swapchain* sc)
 {
 	if (sc->buffer_set >= 0)
 	{
-		WaitForFlip(s_flip_arg, 200000000ull); // the last flip on screen, so no buffer is pending
+		// VideoOut refuses to unregister a set while one of its buffers is still scanout. Waiting for
+		// the last image flip is not enough: it only means that buffer reached the screen, not that it
+		// left it. Idle the device so GPU-side flips are in VideoOut's queue, then queue a blank flip
+		// behind them and wait for it before unregistering. This is rare (swapchain destruction or
+		// recreation), unlike the per-frame QueueWaitIdle fallback.
+		Device<PFN_vkDeviceWaitIdle>(sc->device, "vkDeviceWaitIdle")(sc->device);
+		const int64_t blank_arg = s_flip_arg.fetch_add(1, std::memory_order_relaxed) + 1;
+		const int blank = sceVideoOutSubmitFlip(s_video, -1, ORBIS_VIDEO_OUT_FLIP_VSYNC, blank_arg);
+		if (blank < 0)
+		{
+			Log("blank flip before unregister failed: %#x", static_cast<unsigned>(blank));
+		}
+		else if (!WaitForFlip(blank_arg, 200000000ull))
+		{
+			Log("blank flip before unregister did not reach the screen in 200 ms");
+		}
 		const int r = sceVideoOutUnregisterBuffers(s_video, sc->buffer_set);
 		Log("buffers unregistered (%#x)", static_cast<unsigned>(r));
 		if (r < 0)
@@ -566,6 +705,19 @@ VKAPI_ATTR VkResult VKAPI_CALL CreateSwapchainKHR(
 	sc->extent = info->imageExtent;
 	sc->format = info->imageFormat;
 	sc->present_mode = info->presentMode;
+	if (sc->present_mode == VK_PRESENT_MODE_MAILBOX_KHR)
+	{
+		// VideoOut cannot replace a queued flip, so exact mailbox is not offered. If a renderer passes
+		// it anyway, use bounded FIFO rather than the previous HSYNC fallback (which both tore and was
+		// the opposite of mailbox's no-tearing guarantee).
+		sc->present_mode = VK_PRESENT_MODE_FIFO_KHR;
+		Log("mailbox present mode requested but not offered; using bounded FIFO/vsync instead");
+	}
+	else if (sc->present_mode != VK_PRESENT_MODE_FIFO_KHR && sc->present_mode != VK_PRESENT_MODE_IMMEDIATE_KHR)
+	{
+		Log("present mode %d is not offered; using FIFO/vsync instead", static_cast<int>(info->presentMode));
+		sc->present_mode = VK_PRESENT_MODE_FIFO_KHR;
+	}
 	void* addresses[kImages];
 	uint32_t pitch = sc->extent.width;
 	for (uint32_t i = 0; i < kImages; i++)
@@ -624,6 +776,7 @@ VKAPI_ATTR VkResult VKAPI_CALL CreateSwapchainKHR(
 		group++;
 	if (group == kSlotGroups)
 	{
+		s_stat_slot_exhausted.fetch_add(1, std::memory_order_relaxed);
 		Log("vkCreateSwapchainKHR: every VideoOut slot group is still in use");
 		DestroyImages(sc);
 		delete sc;
@@ -631,11 +784,22 @@ VKAPI_ATTR VkResult VKAPI_CALL CreateSwapchainKHR(
 	}
 	sc->first = group * kSlotGroup;
 	sc->buffer_set = sceVideoOutRegisterBuffers(s_video, sc->first, addresses, kImages, &attribute);
+	if (sc->buffer_set < 0)
+	{
+		s_stat_register_failures.fetch_add(1, std::memory_order_relaxed);
+		const int first_error = sc->buffer_set;
+		Log("sceVideoOutRegisterBuffers failed: %#x; retrying once", static_cast<unsigned>(first_error));
+		s_stat_register_retries.fetch_add(1, std::memory_order_relaxed);
+		RetryRetired();
+		sc->buffer_set = sceVideoOutRegisterBuffers(s_video, sc->first, addresses, kImages, &attribute);
+		if (sc->buffer_set < 0)
+			s_stat_register_failures.fetch_add(1, std::memory_order_relaxed);
+	}
 	if (sc->buffer_set >= 0)
 		s_group_used[group] = true;
 	if (sc->buffer_set < 0)
 	{
-		Log("sceVideoOutRegisterBuffers failed: %#x", static_cast<unsigned>(sc->buffer_set));
+		Log("sceVideoOutRegisterBuffers retry failed: %#x", static_cast<unsigned>(sc->buffer_set));
 		DestroyImages(sc);
 		delete sc;
 		return VK_ERROR_INITIALIZATION_FAILED;
@@ -647,14 +811,12 @@ VKAPI_ATTR VkResult VKAPI_CALL CreateSwapchainKHR(
 	return VK_SUCCESS;
 }
 
-VKAPI_ATTR void VKAPI_CALL DestroySwapchainKHR(VkDevice device, VkSwapchainKHR swapchain, const VkAllocationCallbacks*)
+VKAPI_ATTR void VKAPI_CALL DestroySwapchainKHR(VkDevice, VkSwapchainKHR swapchain, const VkAllocationCallbacks*)
 {
 	if (!swapchain)
 		return;
 	std::lock_guard<std::mutex> guard(s_lock);
 	Swapchain* sc = reinterpret_cast<Swapchain*>(swapchain);
-	if (s_queue)
-		Device<PFN_vkQueueWaitIdle>(device, "vkQueueWaitIdle")(s_queue);
 	ReleaseBuffers(sc);
 	DestroyImages(sc);
 	delete sc;
@@ -696,22 +858,42 @@ VkCommandBuffer EmptyCommandBuffer()
 	std::lock_guard<std::mutex> guard(s_lock);
 	if (s_empty_cb && s_empty_cb_device == s_device)
 		return s_empty_cb;
+	if (!s_device)
+		return VK_NULL_HANDLE;
 	VkCommandPoolCreateInfo pool_info = {VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
 	pool_info.queueFamilyIndex = s_queue_family;
 	VkCommandPool pool = VK_NULL_HANDLE;
-	if (Device<PFN_vkCreateCommandPool>(s_device, "vkCreateCommandPool")(s_device, &pool_info, nullptr, &pool) != VK_SUCCESS)
+	const auto destroy_pool = Device<PFN_vkDestroyCommandPool>(s_device, "vkDestroyCommandPool");
+	VkResult r = Device<PFN_vkCreateCommandPool>(s_device, "vkCreateCommandPool")(s_device, &pool_info, nullptr, &pool);
+	if (r != VK_SUCCESS)
+	{
+		Log("empty command buffer: vkCreateCommandPool failed (%d)", r);
 		return VK_NULL_HANDLE;
+	}
 	VkCommandBufferAllocateInfo alloc = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
 	alloc.commandPool = pool;
 	alloc.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
 	alloc.commandBufferCount = 1;
 	VkCommandBuffer cb = VK_NULL_HANDLE;
-	if (Device<PFN_vkAllocateCommandBuffers>(s_device, "vkAllocateCommandBuffers")(s_device, &alloc, &cb) != VK_SUCCESS)
+	r = Device<PFN_vkAllocateCommandBuffers>(s_device, "vkAllocateCommandBuffers")(s_device, &alloc, &cb);
+	if (r != VK_SUCCESS)
+	{
+		Log("empty command buffer: vkAllocateCommandBuffers failed (%d)", r);
+		destroy_pool(s_device, pool, nullptr);
 		return VK_NULL_HANDLE;
+	}
 	VkCommandBufferBeginInfo begin = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
 	begin.flags = VK_COMMAND_BUFFER_USAGE_SIMULTANEOUS_USE_BIT;
-	Device<PFN_vkBeginCommandBuffer>(s_device, "vkBeginCommandBuffer")(cb, &begin);
-	Device<PFN_vkEndCommandBuffer>(s_device, "vkEndCommandBuffer")(cb);
+	r = Device<PFN_vkBeginCommandBuffer>(s_device, "vkBeginCommandBuffer")(cb, &begin);
+	if (r == VK_SUCCESS)
+		r = Device<PFN_vkEndCommandBuffer>(s_device, "vkEndCommandBuffer")(cb);
+	if (r != VK_SUCCESS)
+	{
+		Log("empty command buffer: recording failed (%d)", r);
+		Device<PFN_vkFreeCommandBuffers>(s_device, "vkFreeCommandBuffers")(s_device, pool, 1, &cb);
+		destroy_pool(s_device, pool, nullptr);
+		return VK_NULL_HANDLE;
+	}
 	s_empty_cb = cb; // the pool lives as long as the device (the next device makes its own)
 	s_empty_cb_device = s_device;
 	Log("empty command buffer ready for submissions without one");
@@ -723,7 +905,9 @@ VkResult FenceSubmit(VkDevice device, VkFence fence)
 {
 	VkSubmitInfo submit = {VK_STRUCTURE_TYPE_SUBMIT_INFO};
 	VkCommandBuffer cb = EmptyCommandBuffer();
-	submit.commandBufferCount = cb ? 1 : 0;
+	if (!cb)
+		return VK_ERROR_OUT_OF_HOST_MEMORY;
+	submit.commandBufferCount = 1;
 	submit.pCommandBuffers = &cb;
 	return Device<PFN_vkQueueSubmit>(device, "vkQueueSubmit")(s_queue, 1, &submit, fence);
 }
@@ -731,48 +915,78 @@ VkResult FenceSubmit(VkDevice device, VkFence fence)
 VKAPI_ATTR VkResult VKAPI_CALL QueueSubmit(VkQueue queue, uint32_t count, const VkSubmitInfo* submits, VkFence fence)
 {
 	static PFN_vkQueueSubmit s_real = Device<PFN_vkQueueSubmit>(s_device, "vkQueueSubmit");
+	bool any_empty = false;
+	for (uint32_t i = 0; i < count; i++)
+		any_empty |= submits[i].commandBufferCount == 0;
+	VkCommandBuffer empty_cb = VK_NULL_HANDLE;
+	if (any_empty)
+	{
+		empty_cb = EmptyCommandBuffer();
+		if (!empty_cb)
+		{
+			static int s_empty_reported;
+			if (s_empty_reported++ < 3)
+				Log("vkQueueSubmit: no empty command buffer for an empty submission");
+			return VK_ERROR_OUT_OF_HOST_MEMORY;
+		}
+	}
+
+	// Keep the common path allocation-free: scan first, and only build filtered copies once a
+	// window-system semaphore or an empty submission actually has to be rewritten.
 	std::vector<VkSubmitInfo> copies;
-	std::vector<std::vector<VkSemaphore>> waits(count), signals(count);
-	std::vector<std::vector<VkPipelineStageFlags>> stages(count);
+	std::vector<std::vector<VkSemaphore>> waits, signals;
+	std::vector<std::vector<VkPipelineStageFlags>> stages;
 	{
 		std::lock_guard<std::mutex> guard(s_semaphore_lock);
-		if (s_acquire_semaphores.empty() && s_present_semaphores.empty())
+		bool changed = any_empty;
+		if (!changed && (!s_acquire_semaphores.empty() || !s_present_semaphores.empty()))
+		{
+			for (uint32_t i = 0; i < count && !changed; i++)
+			{
+				const VkSubmitInfo& in = submits[i];
+				for (uint32_t w = 0; w < in.waitSemaphoreCount && !changed; w++)
+					changed = s_acquire_semaphores.count(in.pWaitSemaphores[w]) != 0;
+				for (uint32_t s = 0; s < in.signalSemaphoreCount && !changed; s++)
+					changed = s_present_semaphores.count(in.pSignalSemaphores[s]) != 0;
+			}
+		}
+		if (!changed)
 			return s_real(queue, count, submits, fence);
-		bool changed = false;
+
+		copies.assign(submits, submits + count);
+		waits.resize(count);
+		signals.resize(count);
+		stages.resize(count);
 		for (uint32_t i = 0; i < count; i++)
 		{
 			const VkSubmitInfo& in = submits[i];
 			for (uint32_t w = 0; w < in.waitSemaphoreCount; w++)
 			{
 				if (s_acquire_semaphores.erase(in.pWaitSemaphores[w]))
-				{
-					changed = true;
 					continue;
-				}
 				waits[i].push_back(in.pWaitSemaphores[w]);
 				stages[i].push_back(in.pWaitDstStageMask[w]);
 			}
 			for (uint32_t s = 0; s < in.signalSemaphoreCount; s++)
 			{
 				if (s_present_semaphores.count(in.pSignalSemaphores[s]))
-				{
-					changed = true;
 					continue;
-				}
 				signals[i].push_back(in.pSignalSemaphores[s]);
 			}
+			copies[i].waitSemaphoreCount = static_cast<uint32_t>(waits[i].size());
+			copies[i].pWaitSemaphores = waits[i].data();
+			copies[i].pWaitDstStageMask = stages[i].data();
+			copies[i].signalSemaphoreCount = static_cast<uint32_t>(signals[i].size());
+			copies[i].pSignalSemaphores = signals[i].data();
 		}
-		if (!changed)
-			return s_real(queue, count, submits, fence);
 	}
-	copies.assign(submits, submits + count);
-	for (uint32_t i = 0; i < count; i++)
+	for (VkSubmitInfo& copy : copies)
 	{
-		copies[i].waitSemaphoreCount = static_cast<uint32_t>(waits[i].size());
-		copies[i].pWaitSemaphores = waits[i].data();
-		copies[i].pWaitDstStageMask = stages[i].data();
-		copies[i].signalSemaphoreCount = static_cast<uint32_t>(signals[i].size());
-		copies[i].pSignalSemaphores = signals[i].data();
+		if (copy.commandBufferCount == 0)
+		{
+			copy.commandBufferCount = 1;
+			copy.pCommandBuffers = &empty_cb;
+		}
 	}
 	return s_real(queue, count, copies.data(), fence);
 }
@@ -784,72 +998,74 @@ VKAPI_ATTR VkResult VKAPI_CALL QueueSubmit2(VkQueue queue, uint32_t count, const
 		auto real = Device<PFN_vkQueueSubmit2>(s_device, "vkQueueSubmit2");
 		return real ? real : Device<PFN_vkQueueSubmit2>(s_device, "vkQueueSubmit2KHR");
 	}();
-	std::vector<VkSubmitInfo2> copies;
-	std::vector<std::vector<VkSemaphoreSubmitInfo>> waits(count), signals(count);
 	bool any_empty = false;
 	for (uint32_t i = 0; i < count; i++)
 		any_empty |= submits[i].commandBufferInfoCount == 0;
 	VkCommandBufferSubmitInfo empty_cb = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO};
 	if (any_empty)
+	{
 		empty_cb.commandBuffer = EmptyCommandBuffer();
-	// Submissions without a command buffer get the empty one (see EmptyCommandBuffer).
-	const auto fill_empty = [&](std::vector<VkSubmitInfo2>& list) {
 		if (!empty_cb.commandBuffer)
-			return;
-		for (VkSubmitInfo2& s : list)
 		{
-			if (s.commandBufferInfoCount == 0)
-			{
-				s.commandBufferInfoCount = 1;
-				s.pCommandBufferInfos = &empty_cb;
-			}
+			static int s_empty_reported;
+			if (s_empty_reported++ < 3)
+				Log("vkQueueSubmit2: no empty command buffer for an empty submission");
+			return VK_ERROR_OUT_OF_HOST_MEMORY;
 		}
-	};
+	}
+
+	std::vector<VkSubmitInfo2> copies;
+	std::vector<std::vector<VkSemaphoreSubmitInfo>> waits, signals;
 	{
 		std::lock_guard<std::mutex> guard(s_semaphore_lock);
-		if (s_acquire_semaphores.empty() && s_present_semaphores.empty())
-		{
-			if (!any_empty)
-				return s_real(queue, count, submits, fence);
-			copies.assign(submits, submits + count);
-			fill_empty(copies);
-			return s_real(queue, count, copies.data(), fence);
-		}
 		bool changed = any_empty;
+		if (!changed && (!s_acquire_semaphores.empty() || !s_present_semaphores.empty()))
+		{
+			for (uint32_t i = 0; i < count && !changed; i++)
+			{
+				const VkSubmitInfo2& in = submits[i];
+				for (uint32_t w = 0; w < in.waitSemaphoreInfoCount && !changed; w++)
+					changed = s_acquire_semaphores.count(in.pWaitSemaphoreInfos[w].semaphore) != 0;
+				for (uint32_t s = 0; s < in.signalSemaphoreInfoCount && !changed; s++)
+					changed = s_present_semaphores.count(in.pSignalSemaphoreInfos[s].semaphore) != 0;
+			}
+		}
+		if (!changed)
+			return s_real(queue, count, submits, fence);
+
+		copies.assign(submits, submits + count);
+		waits.resize(count);
+		signals.resize(count);
 		for (uint32_t i = 0; i < count; i++)
 		{
 			const VkSubmitInfo2& in = submits[i];
 			for (uint32_t w = 0; w < in.waitSemaphoreInfoCount; w++)
 			{
 				if (s_acquire_semaphores.erase(in.pWaitSemaphoreInfos[w].semaphore))
-				{
-					changed = true;
 					continue;
-				}
 				waits[i].push_back(in.pWaitSemaphoreInfos[w]);
 			}
 			for (uint32_t s = 0; s < in.signalSemaphoreInfoCount; s++)
 			{
 				if (s_present_semaphores.count(in.pSignalSemaphoreInfos[s].semaphore))
-				{
-					changed = true;
 					continue;
-				}
 				signals[i].push_back(in.pSignalSemaphoreInfos[s]);
 			}
+			copies[i].waitSemaphoreInfoCount = static_cast<uint32_t>(waits[i].size());
+			copies[i].pWaitSemaphoreInfos = waits[i].data();
+			copies[i].signalSemaphoreInfoCount = static_cast<uint32_t>(signals[i].size());
+			copies[i].pSignalSemaphoreInfos = signals[i].data();
 		}
-		if (!changed)
-			return s_real(queue, count, submits, fence);
 	}
-	copies.assign(submits, submits + count);
-	for (uint32_t i = 0; i < count; i++)
+	// Submissions without a command buffer get the empty one (see EmptyCommandBuffer).
+	for (VkSubmitInfo2& copy : copies)
 	{
-		copies[i].waitSemaphoreInfoCount = static_cast<uint32_t>(waits[i].size());
-		copies[i].pWaitSemaphoreInfos = waits[i].data();
-		copies[i].signalSemaphoreInfoCount = static_cast<uint32_t>(signals[i].size());
-		copies[i].pSignalSemaphoreInfos = signals[i].data();
+		if (copy.commandBufferInfoCount == 0)
+		{
+			copy.commandBufferInfoCount = 1;
+			copy.pCommandBufferInfos = &empty_cb;
+		}
 	}
-	fill_empty(copies);
 	return s_real(queue, count, copies.data(), fence);
 }
 
@@ -859,11 +1075,15 @@ VKAPI_ATTR VkResult VKAPI_CALL AcquireNextImageKHR(VkDevice device, VkSwapchainK
 	Swapchain* sc = reinterpret_cast<Swapchain*>(swapchain);
 	if (sc->retired || sc->buffer_set < 0)
 		return VK_ERROR_OUT_OF_DATE_KHR;
-	// Round robin: the next image, once a later flip has replaced it on screen.
-	const uint32_t i = sc->next;
-	if (sc->shown_by[i] != 0 && !WaitForFlip(sc->shown_by[i] + 1, timeout))
+	uint32_t i = 0;
+	if (!WaitForImage(sc, timeout, &i))
+	{
+		if (timeout == 0)
+			s_stat_acquire_not_ready.fetch_add(1, std::memory_order_relaxed);
+		else
+			s_stat_acquire_timeouts.fetch_add(1, std::memory_order_relaxed);
 		return timeout == 0 ? VK_NOT_READY : VK_TIMEOUT;
-	sc->next = (i + 1) % kImages;
+	}
 	*index = i;
 	if (semaphore)
 	{
@@ -873,6 +1093,27 @@ VKAPI_ATTR VkResult VKAPI_CALL AcquireNextImageKHR(VkDevice device, VkSwapchainK
 	if (fence)
 		return FenceSubmit(device, fence);
 	return VK_SUCCESS;
+}
+
+// A CPU fallback here means vkQueueWaitIdle in the present path: a large CPU/GPU bubble. Keep the
+// first few exact errors, then rate-limit the reminder because this can otherwise log every frame.
+void NoteFlipFallback(int64_t arg, uint32_t image, int error)
+{
+	const uint64_t total = s_stat_flip_fallbacks.fetch_add(1, std::memory_order_relaxed) + 1;
+	if (total <= 3)
+	{
+		Log("GPU flip %lld of image %u failed (%d); using vkQueueWaitIdle CPU fallback",
+			static_cast<long long>(arg), image, error);
+		return;
+	}
+	static std::atomic<uint64_t> s_last_log_us{0};
+	const uint64_t now = sceKernelGetProcessTime();
+	uint64_t last = s_last_log_us.load(std::memory_order_relaxed);
+	if ((last == 0 || now - last >= 5000000) && s_last_log_us.compare_exchange_strong(last, now))
+	{
+		Log("GPU flip submission is still falling back to vkQueueWaitIdle (%llu times); expect a large CPU/GPU bubble",
+			static_cast<unsigned long long>(total));
+	}
 }
 
 VKAPI_ATTR VkResult VKAPI_CALL QueuePresentKHR(VkQueue queue, const VkPresentInfoKHR* info)
@@ -895,16 +1136,18 @@ VKAPI_ATTR VkResult VKAPI_CALL QueuePresentKHR(VkQueue queue, const VkPresentInf
 			const uint32_t image = info->pImageIndices[n];
 			const unsigned mode =
 				sc->present_mode == VK_PRESENT_MODE_FIFO_KHR ? ORBIS_VIDEO_OUT_FLIP_VSYNC : ORBIS_VIDEO_OUT_FLIP_HSYNC;
-			const int64_t arg = ++s_flip_arg;
+			const int64_t arg = s_flip_arg.fetch_add(1, std::memory_order_relaxed) + 1;
 			int flip = ac_ps4_submit_flip(s_video, static_cast<unsigned>(sc->first) + image, mode, arg);
 			if (flip != 0)
 			{
 				// No GPU-side flip: wait for the GPU here, then flip from the CPU.
+				NoteFlipFallback(arg, image, flip);
 				Device<PFN_vkQueueWaitIdle>(sc->device, "vkQueueWaitIdle")(queue);
 				flip = sceVideoOutSubmitFlip(s_video, sc->first + static_cast<int>(image), mode, arg);
 			}
 			if (flip < 0)
 			{
+				s_stat_present_failures.fetch_add(1, std::memory_order_relaxed);
 				static int s_reported;
 				if (s_reported++ < 5)
 					Log("flip %lld of image %u failed: %#x", static_cast<long long>(arg), image, static_cast<unsigned>(flip));
@@ -912,6 +1155,7 @@ VKAPI_ATTR VkResult VKAPI_CALL QueuePresentKHR(VkQueue queue, const VkPresentInf
 			}
 			else
 			{
+				s_stat_presents.fetch_add(1, std::memory_order_relaxed);
 				sc->shown_by[image] = arg;
 				static int s_logged;
 				if (s_logged++ < 3)
@@ -1014,6 +1258,23 @@ VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL GetInstanceProcAddr(VkInstance instance
 	return __real_vk_icdGetInstanceProcAddr(instance, name);
 }
 } // namespace
+
+extern "C" __attribute__((visibility("default"))) void ps4_wsi_present_stats(Ps4WsiPresentStats* out)
+{
+	if (!out)
+		return;
+	out->presents = s_stat_presents.load(std::memory_order_relaxed);
+	out->present_failures = s_stat_present_failures.load(std::memory_order_relaxed);
+	out->flip_fallbacks = s_stat_flip_fallbacks.load(std::memory_order_relaxed);
+	out->acquire_timeouts = s_stat_acquire_timeouts.load(std::memory_order_relaxed);
+	out->acquire_not_ready = s_stat_acquire_not_ready.load(std::memory_order_relaxed);
+	out->videoout_register_failures = s_stat_register_failures.load(std::memory_order_relaxed);
+	out->videoout_register_retries = s_stat_register_retries.load(std::memory_order_relaxed);
+	out->videoout_unregister_retries = s_stat_unregister_retries.load(std::memory_order_relaxed);
+	out->videoout_unregister_retry_failures = s_stat_unregister_retry_failures.load(std::memory_order_relaxed);
+	out->videoout_unregister_retry_successes = s_stat_unregister_retry_successes.load(std::memory_order_relaxed);
+	out->videoout_slot_exhausted = s_stat_slot_exhausted.load(std::memory_order_relaxed);
+}
 
 extern "C" VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL __wrap_vk_icdGetInstanceProcAddr(VkInstance instance, const char* name)
 {
