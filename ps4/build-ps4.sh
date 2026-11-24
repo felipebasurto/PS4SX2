@@ -14,23 +14,34 @@ export PS4_SYSROOT="${PS4_SYSROOT:-$HOME/cemups4-build/sysroot}"
 OPENORBIS="${OPENORBIS:-/opt/pacbrew/ps4/openorbis}"
 mode="${1:-}"
 
-echo "[build-ps4] compiling"
+# Performance experiment knobs. The environment is the interface, as with ORBIS_ORDER on PS5SX2's link scripts:
+#   NARROW=0|1 and LTO=0|1 select Makefile.ps4's compile flags; ORBIS_ORDER=<file|none> selects the order file.
+narrow="${NARROW:-1}"
+lto="${LTO:-0}"
+order="${ORBIS_ORDER:-$HERE/orbis-ps4-hot.order}"
+# CMake wants a full path; a relative override is the caller's, as a shell path would be.
+if [ "$order" != none ] && [ "${order#/}" = "$order" ]; then
+    order="$PWD/$order"
+fi
+
+echo "[build-ps4] compiling (NARROW=$narrow LTO=$lto ORBIS_ORDER=$order)"
 # paraLLEl-GS as a second renderer when ps4/build-pgs.sh has built its libraries.
 pgs=0
 [ -s "$PSB/pgs/libs.txt" ] && pgs=1 && echo "[build-ps4] with paraLLEl-GS"
-make -C "$HERE" -f Makefile.ps4 -j"${JOBS:-20}" PGS=$pgs all objects.txt > "$PSB/compile.log" 2>&1 \
+make -C "$HERE" -f Makefile.ps4 -j"${JOBS:-20}" PGS=$pgs NARROW="$narrow" LTO="$lto" all objects.txt > "$PSB/compile.log" 2>&1 \
     || { grep -E "error" "$PSB/compile.log" | head -40; exit 1; }
 tail -1 "$PSB/compile.log"
 
 echo "[build-ps4] linking"
 source "$PORT/scripts/ps4-env.sh"
 link="$PSB/build/link"
-if [ ! -f "$link/Makefile" ]; then
-    ps4_cmake -S "$HERE/link" -B "$link" -G "Unix Makefiles" \
-        -DCMAKE_TOOLCHAIN_FILE="$PORT/toolchain/ps4-cemu.cmake" -DPS4_PORT_DIR="$PORT" \
-        -DPCSX2_OBJECTS_FILE="$HERE/objects.txt" -DPS4_PAID=0x3800000000000035 > "$PSB/link-configure.log" 2>&1 \
-        || { tail -30 "$PSB/link-configure.log"; exit 1; }
-fi
+# Reconfigure every time: CMake caches PS4_LTO and ORBIS_ORDER_FILE, so an existing link tree would otherwise keep
+# the previous experiment's values. This does not recompile the port objects; Makefile.ps4 owns those.
+ps4_cmake -S "$HERE/link" -B "$link" -G "Unix Makefiles" \
+    -DCMAKE_TOOLCHAIN_FILE="$PORT/toolchain/ps4-cemu.cmake" -DPS4_PORT_DIR="$PORT" \
+    -DPCSX2_OBJECTS_FILE="$HERE/objects.txt" -DPS4_PAID=0x3800000000000035 \
+    -DPS4_NARROW="$narrow" -DPS4_LTO="$lto" -DORBIS_ORDER_FILE="$order" > "$PSB/link-configure.log" 2>&1 \
+    || { tail -30 "$PSB/link-configure.log"; exit 1; }
 elf="$link/pcsx2"
 eboot="$link/pcsx2_eboot/eboot.bin"
 rm -f "$eboot" # a failed link must not leave the last eboot to be packaged

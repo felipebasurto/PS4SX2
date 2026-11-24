@@ -22,6 +22,51 @@ set_source_files_properties(${pcsx2_objects} PROPERTIES EXTERNAL_OBJECT TRUE GEN
 add_executable(pcsx2 ${PS4_RUNTIME_SOURCES} ${pcsx2_objects})
 set_target_properties(pcsx2 PROPERTIES LINKER_LANGUAGE CXX)
 
+# Performance experiment inputs (build-ps4.sh passes them every time, so a changed knob reaches this cached build).
+set(PS4_NARROW "1" CACHE STRING "1 when Makefile.ps4 blocked LLVM's narrow store optimization")
+set(PS4_LTO "0" CACHE STRING "1 when Makefile.ps4 compiled the objects with -flto=thin")
+if (DEFINED ENV{ORBIS_ORDER})
+    set(_orbis_order_default "$ENV{ORBIS_ORDER}")
+else ()
+    get_filename_component(_orbis_order_default "${CMAKE_CURRENT_SOURCE_DIR}/../orbis-ps4-hot.order" ABSOLUTE)
+endif ()
+set(ORBIS_ORDER_FILE "${_orbis_order_default}" CACHE STRING "ld.lld --symbol-ordering-file, or 'none'")
+
+# ps4.cmake links with ld.lld directly, not through clang's driver. clang's -flto=thin is a driver flag and is not
+# valid here; ld.lld reads Makefile.ps4's ThinLTO bitcode objects and runs their ThinLTO backends itself. That
+# ld.lld must be new enough to read clang-21's bitcode (normally the LLVM 21 ld.lld next to it). Compile the
+# runtime sources the same way and keep the backend at the compile flags' O3. Needs proper testing: LTO can change
+# both performance and the order file's effect.
+if (PS4_LTO STREQUAL "1")
+    target_compile_options(pcsx2 PRIVATE -flto=thin)
+    string(APPEND CMAKE_EXE_LINKER_FLAGS " --lto-O3")
+    # Without LTO this reaches the backend while each object is compiled. With LTO the backend runs here instead,
+    # and clang does not encode that -mllvm answer in the bitcode, so ld.lld needs it again.
+    if (PS4_NARROW STREQUAL "1")
+        string(APPEND CMAKE_EXE_LINKER_FLAGS " -mllvm -combiner-reduce-load-op-store-width=false")
+    endif ()
+    message(STATUS "ThinLTO: bitcode objects, ld.lld backend at O3")
+endif ()
+
+# As ps5/coreorbis/link-vk.sh: hot functions first in .text (lld --symbol-ordering-file). ORBIS_ORDER=none disables
+# it; another file can be named without editing the build. Makefile.ps4's C++ objects are compiled with
+# -ffunction-sections, the sections this reorders.
+if (NOT ORBIS_ORDER_FILE STREQUAL "none")
+    if (EXISTS "${ORBIS_ORDER_FILE}")
+        string(APPEND CMAKE_EXE_LINKER_FLAGS " --symbol-ordering-file=${ORBIS_ORDER_FILE} --no-warn-symbol-ordering")
+        set_property(TARGET pcsx2 APPEND PROPERTY LINK_DEPENDS "${ORBIS_ORDER_FILE}")
+        message(STATUS "function order: ${ORBIS_ORDER_FILE}")
+    else ()
+        message(WARNING "ORBIS_ORDER_FILE does not exist, linking without it: ${ORBIS_ORDER_FILE}")
+    endif ()
+else ()
+    message(STATUS "function order: disabled")
+endif ()
+
+# Deliberately no --gc-sections. PS5SX2 uses function/data sections for hot-function ordering in its main eboot but
+# does not garbage collect it. This binary has .incbin resource sections and constructor ordering requirements, and
+# losing one the console side expects is worse than the unmeasured size win; follow that conservative link until a
+# PS4 test proves GC safe.
 # The Vulkan window system on VideoOut (ps4/ps4_vk_wsi.cpp): PCSX2's and the frontend's calls to RADV's entry point go
 # through it.
 string(APPEND CMAKE_EXE_LINKER_FLAGS " --wrap=vk_icdGetInstanceProcAddr")
