@@ -41,6 +41,12 @@ PS4_C_FLAGS := -target x86_64-pc-freebsd12-elf -D_GNU_SOURCE -D__PS4__ -D__OPENO
   -isystem $(PS4_SYSROOT)/include
 PS4_CXX_FLAGS := -nostdinc++ -isystem $(PS4_SYSROOT)/include/c++/v1 $(PS4_C_FLAGS)
 
+# Performance knobs for Jaguar A/B testing (needs proper testing on the console):
+#   NARROW=1 (default) blocks LLVM's narrow store optimization; NARROW=0 leaves LLVM's own choice.
+#   LTO=1 compiles C and C++ objects for ThinLTO; link/CMakeLists.txt records it for ld.lld.
+#   ORBIS_ORDER=<file|none> chooses the hot-function order file at the link (build-ps4.sh passes it).
+# NARROW and LTO are compile flags, so the objects carry a stamp that rebuilds them when either knob changes.
+#
 # vk-285-91: -mno-vzeroupper. The GS thread's profiles had 5-7% of their samples right after a VZEROUPPER;
 # Zen 2 has no SSE/AVX transition penalty for it to avoid (the upper halves are renamed apart), and leaving
 # it out changes no results (the ABI doesn't keep the upper halves across calls). main-boot [vzubench]
@@ -50,14 +56,24 @@ PS4_CXX_FLAGS := -nostdinc++ -isystem $(PS4_SYSROOT)/include/c++/v1 $(PS4_C_FLAG
 # the narrower store and waits until the store reaches the cache, behind every older store in the queue.
 # vk-285-101's GS profile had 3.8% of the thread on one such load (ApplyTFXState's m_dirty_flags after
 # SetScissor's orb); PCSX2's register and flag words (VIF/DMA/GIF bitfields, EE state) get the same treatment.
-# ORBIS_STORE_NARROWING=1 builds with the narrowing as before.
-ORBIS_STORE_NARROWING ?= 0
-ifeq ($(ORBIS_STORE_NARROWING),0)
+# That profile was Zen 2's store queue. Jaguar is in-order with a different memory pipeline, so the same
+# narrowing can help, hurt or do nothing there: compare NARROW=0 and NARROW=1 rather than keeping the PS5 answer.
+NARROW ?= 1
+ifeq ($(NARROW),1)
 NARROW_FLAGS := -mllvm -combiner-reduce-load-op-store-width=false
 else
 NARROW_FLAGS :=
 endif
-CXXFLAGS := $(PS4_CXX_FLAGS) -Wall -g -O3 -DNDEBUG -std=c++20 -march=btver2 $(NARROW_FLAGS) \
+# ThinLTO is compile-side here: the objects become LLVM bitcode. The PS4 CMake toolchain calls ld.lld directly,
+# not clang's driver, so clang's -flto=thin must not be added to the link line; ld.lld reads the bitcode and runs
+# its ThinLTO backends itself (link/CMakeLists.txt adds ld.lld's --lto-O3, and NARROW's backend option, when PS4_LTO=1).
+LTO ?= 0
+ifeq ($(LTO),1)
+LTO_FLAGS := -flto=thin
+else
+LTO_FLAGS :=
+endif
+CXXFLAGS := $(PS4_CXX_FLAGS) -Wall -g -O3 -DNDEBUG -std=c++20 -march=btver2 $(NARROW_FLAGS) $(LTO_FLAGS) \
   -D_M_X86=1 -D__POSIX__=1 -DXBYAK_NO_EXCEPTION \
   -DOVERRIDE_HOST_PAGE_SIZE=0x4000 -DOVERRIDE_HOST_CACHE_LINE_SIZE=64 \
   -fno-exceptions -fno-rtti -ffunction-sections -fdata-sections \
@@ -281,7 +297,7 @@ SRCS := $(SRCS) $(IMGUI_SRCS)
 SRCS := $(SRCS) $(PCSX2)/pcsx2/Achievements.cpp $(DEV9_SRCS)
 C_SRCS := $(RCHEEVOS_SRCS) $(DEMANGLE_SRCS)
 
-CFLAGS := $(PS4_C_FLAGS) -O3 -DNDEBUG -march=btver2 $(NARROW_FLAGS) -D_M_X86=1 \
+CFLAGS := $(PS4_C_FLAGS) -O3 -DNDEBUG -march=btver2 $(NARROW_FLAGS) $(LTO_FLAGS) -D_M_X86=1 \
   -DRC_NO_THREADS=1 -DRC_HASH_NO_DISC -DRC_HASH_NO_ENCRYPTED -DRC_HASH_NO_ROM -DRC_HASH_NO_ZIP \
   -include string.h -include stdlib.h \
   -I$(PCSX2)/3rdparty/rcheevos/include -I$(PCSX2)/3rdparty/demangler/include
@@ -490,6 +506,15 @@ ifeq ($(PGS),1)
 OBJS += $(PGS_OBJ)
 endif
 
+# Make does not rebuild objects when only their command-line flags change. This stamp does it for the two compile
+# knobs: another NARROW or LTO value names another stamp, and every object then rebuilds once against it.
+BUILD_STAMP := $(OBJDIR)/.build-flags-n$(NARROW)-lto$(LTO)
+$(BUILD_STAMP):
+	@mkdir -p $(dir $@)
+	@rm -f $(OBJDIR)/.build-flags-*
+	@touch $@
+$(OBJS): $(BUILD_STAMP)
+
 # vk-285-108: the CHD code's flags (see CHD_CSRCS): single-threaded LZMA, zstd's C Huffman decoder (its
 # amd64 .S isn't vendored) without the legacy formats or the trace hooks.
 $(patsubst $(PCSX2)/%.c,$(OBJDIR)/%.o,$(CHD_CSRCS)): CFLAGS += $(CHD_INCLUDES) -DZ7_ST \
@@ -594,7 +619,7 @@ $(OBJDIR)/frontend/%.o: $(FE_DIR)/%.cpp $(FE_HDRS)
 
 $(OBJDIR)/frontend/%.o: $(FE_DIR)/%.c
 	@mkdir -p $(dir $@)
-	$(CC) $(PS4_C_FLAGS) -O2 -DNDEBUG -march=btver2 -std=c99 -c $< -o $@
+	$(CC) $(PS4_C_FLAGS) -O2 -DNDEBUG -march=btver2 $(LTO_FLAGS) -std=c99 -c $< -o $@
 
 $(OBJDIR)/%.o: $(PCSX2)/%.c
 	@mkdir -p $(dir $@)
