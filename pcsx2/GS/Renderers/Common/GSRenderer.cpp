@@ -900,6 +900,29 @@ static void OrbisPrintLoad()
 			s_tag_prev[i] = tags[i];
 	}
 	{
+		// PS4 port (AI-assisted): the MTVU ring's own rates this second (MTVU.cpp): kicks of the VU thread,
+		// the kicks coalesced away inside ring-space waits, the EE's stalls for ring space, laps on each side,
+		// the VU thread's wakeups and wait paths, and the ring's high-water mark. Jaguar's small caches make
+		// the backlog the number to watch while OrbisMTVURingKB is tuned.
+		extern std::atomic<u64> g_orbis_mtvu_kicks, g_orbis_mtvu_kick_coalesced, g_orbis_mtvu_ring_stalls,
+			g_orbis_mtvu_laps, g_orbis_mtvu_vu_laps, g_orbis_mtvu_vu_wakeups, g_orbis_mtvu_vu_spin_waits,
+			g_orbis_mtvu_vu_sleep_waits;
+		extern std::atomic<u32> g_orbis_mtvu_ring_hwm_kb;
+		static u64 s_mtvu_prev[8] = {};
+		const u64 m[8] = {g_orbis_mtvu_kicks.load(std::memory_order_relaxed),
+			g_orbis_mtvu_kick_coalesced.load(std::memory_order_relaxed), g_orbis_mtvu_ring_stalls.load(std::memory_order_relaxed),
+			g_orbis_mtvu_laps.load(std::memory_order_relaxed), g_orbis_mtvu_vu_laps.load(std::memory_order_relaxed),
+			g_orbis_mtvu_vu_wakeups.load(std::memory_order_relaxed), g_orbis_mtvu_vu_spin_waits.load(std::memory_order_relaxed),
+			g_orbis_mtvu_vu_sleep_waits.load(std::memory_order_relaxed)};
+		printf("[mtvu] per s: kicks=%llu coalesced=%llu ringstalls=%llu laps ee/vu=%llu/%llu wakeups=%llu spin/sleep=%llu/%llu | backlog hwm %u KB\n",
+			static_cast<unsigned long long>(m[0] - s_mtvu_prev[0]), static_cast<unsigned long long>(m[1] - s_mtvu_prev[1]),
+			static_cast<unsigned long long>(m[2] - s_mtvu_prev[2]), static_cast<unsigned long long>(m[3] - s_mtvu_prev[3]),
+			static_cast<unsigned long long>(m[4] - s_mtvu_prev[4]), static_cast<unsigned long long>(m[5] - s_mtvu_prev[5]),
+			static_cast<unsigned long long>(m[6] - s_mtvu_prev[6]), static_cast<unsigned long long>(m[7] - s_mtvu_prev[7]),
+			g_orbis_mtvu_ring_hwm_kb.load(std::memory_order_relaxed));
+		std::memcpy(s_mtvu_prev, m, sizeof(m));
+	}
+	{
 		// vk-285-27: the EE recompiler's churn this second (iR5900.cpp, vtlb.cpp), and the
 		// rec_nocount switch.
 		extern std::atomic<u32> g_orbis_rec_compiles, g_orbis_rec_discards, g_orbis_rec_page_resets,
