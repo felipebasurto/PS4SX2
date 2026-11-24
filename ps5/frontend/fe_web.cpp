@@ -986,7 +986,7 @@ void WebServer::ApiSettings(const Request& req, Response& res)
 	if (g)
 		ReadFile(m_cfg.gs_ini, global_text);
 	const bool has_preset = PresetSection(m_cfg.presets, g ? g->serial : std::string("@global"), preset);
-	const IniState rec = ReadState(preset);
+	const IniState rec = ReadState(FilterPresetForPlatform(preset));
 	const std::vector<std::string>& enabled = own.enabled;
 	const std::vector<std::string>& cheats_on = own.cheats; // 2026-10-08
 	std::string out = "{\"id\":" + Json(id) + ",\"title\":" + Json(g ? g->title : "All games") + ",\"serial\":" +
@@ -1241,6 +1241,7 @@ void WebServer::ApiRecommended(const Request& req, const GameInfo* g, const std:
 		res.body = Error("this build has no recommended settings for all games");
 		return;
 	}
+	preset = FilterPresetForPlatform(preset);
 	std::string header = g ? "# " + g->title + (g->serial.empty() ? std::string() : " (" + g->serial + ")") : std::string("# All games");
 	header += has ? ": PS5SX2's recommended settings, restored by the settings page" :
 	                ": no settings of its own, so it follows the settings for all games (restored by the settings page)";

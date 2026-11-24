@@ -79,6 +79,9 @@ bool SameState(IniState a, IniState b);
 std::string DescribeChanges(const IniState& before, const IniState& after);
 // One section of presets.ini ("[@global]", "[SLUS-20733]"). False when there is none.
 bool PresetSection(const std::string& presets, const std::string& id, std::string& out);
+// PS4 port (AI-assisted): the preset text as the Recommended button should write it on this platform
+// (PS5 lines that cost too much on a PS4 dropped; the preset itself on other platforms).
+std::string FilterPresetForPlatform(const std::string& preset);
 
 // ---- 2026-10-08 (AI-assisted): PCSX2's manual hardware fixes (EmuCore/GS/UserHacks=true). While they are on, PCSX2
 // leaves out the game database's hardware-renderer fixes for the game (GameDatabase.cpp applyGSHardwareFixes) unless the

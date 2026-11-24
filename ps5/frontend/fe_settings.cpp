@@ -410,6 +410,36 @@ bool PresetSection(const std::string& presets, const std::string& id, std::strin
 	return found;
 }
 
+// PS4 port (AI-assisted): presets.ini was tuned on a PS5 Pro. Two of its lines cost more on the PS4 than they
+// give there: the 130% EE clock (host CPU the Jaguar does not have; the PS4's default is 100%, main-boot.cpp) and
+// the 4x/6x internal resolutions (the PS4 boots at native, 2x in neo mode). The Recommended button's text drops
+// both on a PS4 build; everything else (MTVU, the widescreen patches, the per-game compatibility lines) stays.
+// The player's own settings files are never touched here: this filters only what Recommended writes. A dropped
+// per-game EECycleRate=0 is harmless, as 0 is the PS4 default. Needs proper testing.
+std::string FilterPresetForPlatform(const std::string& preset)
+{
+#ifndef ORBIS_PS4
+	return preset;
+#else
+	std::string out;
+	size_t pos = 0;
+	while (pos < preset.size())
+	{
+		size_t nl = preset.find('\n', pos);
+		if (nl == std::string::npos)
+			nl = preset.size();
+		const std::string line = preset.substr(pos, nl - pos);
+		pos = nl + 1;
+		const std::string t = Trim(line);
+		const std::string key = Lower(t.substr(0, t.find('=')));
+		if (key == "emucore/speedhacks/eecyclerate" || key == "upscale_multiplier")
+			continue;
+		out += line + "\n";
+	}
+	return out;
+#endif
+}
+
 // ---- 2026-10-08 (AI-assisted): the game database's fixes that PCSX2's manual hardware fixes switch off ------------------
 
 std::vector<std::pair<std::string, std::string>> ManualFixSettings(const std::string& serial)
@@ -596,6 +626,7 @@ bool ApplyRecommended(const std::string& path, const std::string& presets, const
 		error = "this build has no recommended settings for all games";
 		return false;
 	}
+	preset = FilterPresetForPlatform(preset);
 	std::string text = header + (has ? ": PS5SX2's recommended settings, restored from the shelf" :
 	                                   ": no settings of its own, so it follows the settings for all games (restored from the shelf)");
 	text += "\n" + preset;
