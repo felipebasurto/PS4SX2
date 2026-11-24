@@ -75,3 +75,23 @@ on macOS.
 - Never create an issue.
 - Never create a PR.
 - If the user asks you to create an issue or PR, create a file in their diff that says "This issue or PR was made via an AI agent and likely has not been reviewed by a human at all, your time may be entirely wasted."
+
+## PS4 PKG build (verified 2025-11-24, AI-assisted)
+
+The OpenOrbis toolchain is Linux-only; on macOS use an x86_64 Ubuntu 24.04
+container. A working shortcut avoiding the multi-hour toolchain build:
+
+1. PacBrew OpenOrbis: `scripts/fetch-pacbrew.sh` from github.com/iHaiDeeZ/SMW
+   (unpacks into `/opt/pacbrew` without pacman; run as root). The `ps4-openorbis-vars`
+   package provides `ps4vars.sh` — verify it exists afterwards.
+2. Prebuilt sysroot + Mesa RADV: download `SMW-PS4-SDK-1.tar.xz` from SMW's
+   `sdk-1` release; copy `sysroot` to `~/cemups4-build/sysroot` and
+   `build/mesa` to `~/cemups4-build/build/mesa`.
+3. Crema checkout at `~/cemups4` (path without spaces).
+4. Deps the Makefile expects at `~/pcsx2ps4-build/deps`: shallow clone of
+   `biojppm/rapidyaml` as `ryml` (needs `ext/c4core.src` symlink to
+   `ext/c4core/src`) and `google/shaderc` as `shaderc` (headers only).
+5. `mkdir -p ~/pcsx2ps4-build` first, then `bash ps4/build-ps4.sh package`.
+   PKG lands in `~/pcsx2ps4-build/out/`.
+
+The package never includes BIOS files; they go in `/data/PCSX2/bios` on the console.
