@@ -1296,13 +1296,33 @@ static bool orbis_vu1_speed_from(const SettingsInterface& si)
       printf("[boot] MTVU: VU thread spin %s, kick batching %s (EmuCore/Speedhacks/OrbisMTVUSpin, OrbisMTVUBatch)\n",
         spin ? "on" : "off", batch ? "on" : "off");
     // vk-285-90: EmuCore/Speedhacks/OrbisMTVURingKB (256..16384, default 16384 = the whole buffer): the
-    // EE-to-VU ring's length, taken at its next wrap (pcsx2/MTVU.cpp).
+    // EE-to-VU ring's length, taken at its next wrap (pcsx2/MTVU.cpp). PS4 port (AI-assisted): 2048 KB
+    // there, so Jaguar's small caches still hold the EE's writes when the ring comes around; a setting wins.
+    // Needs proper testing against the whole 16 MB ring.
     extern std::atomic<u32> g_orbis_mtvu_ring_kb;
-    int ring_kb = 16384;
+#ifdef ORBIS_PS4
+    constexpr int kOrbisMtvuRingDefaultKB = 2048;
+    const bool ring_user = si.ContainsValue("EmuCore/Speedhacks", "OrbisMTVURingKB");
+#else
+    constexpr int kOrbisMtvuRingDefaultKB = 16384;
+#endif
+    int ring_kb = kOrbisMtvuRingDefaultKB;
     si.GetIntValue("EmuCore/Speedhacks", "OrbisMTVURingKB", &ring_kb);
     const u32 ring = static_cast<u32>(std::clamp(ring_kb, 256, 16384));
+#ifdef ORBIS_PS4
+    static std::atomic<u32> s_ring_logged_value{0};
+    static std::atomic<int> s_ring_logged_source{-1};
+    const int ring_source = ring_user ? 1 : 0;
+    const u32 old_ring = g_orbis_mtvu_ring_kb.exchange(ring, std::memory_order_relaxed);
+    const bool logged_value_changed = s_ring_logged_value.exchange(ring, std::memory_order_relaxed) != ring;
+    const bool logged_source_changed = s_ring_logged_source.exchange(ring_source, std::memory_order_relaxed) != ring_source;
+    if (old_ring != ring || logged_value_changed || logged_source_changed)
+      printf("[boot] MTVU ring %u KB (%s; EmuCore/Speedhacks/OrbisMTVURingKB)\n", ring,
+        ring_user ? "user override" : "PS4 default");
+#else
     if (g_orbis_mtvu_ring_kb.exchange(ring, std::memory_order_relaxed) != ring)
       printf("[boot] MTVU ring %u KB (EmuCore/Speedhacks/OrbisMTVURingKB)\n", ring);
+#endif
   }
 
   bool fast = false;
@@ -2323,15 +2343,16 @@ static void orbis_log_flag_access(const char* when)
   fflush(stdout);
 }
 
-// vk-285-115 (AI-assisted): the release's switch files when the flags folder is missing or empty. The installer writes
+// vk-285-115 (AI-assisted): the release's switch files when the flags folder is missing or incomplete. The installer writes
 // them on a first install only, so a console set up by hand (the eboot and the folders copied over) ran with none: the
 // recompilers' code in JIT shared memory (105 MiB of the ~190 MiB flexible budget), the 8192 texture limit, two
 // swapchain images, no wide memory and the driver's conservative live flags. 1.50's logs: "Failed to initialize GS."
 // in 285 sessions on 23 such consoles (the GS device ran out of memory at its last pipelines), and Need for Speed:
-// Most Wanted's recompiler crash. Not when flags/ holds any file (a tester's own set, even a single file: that is
-// also how to keep a folder of no switches) or when a release switch sits in the top folder (the layout before
-// vk-285-33, which OrbisFlag still reads). games/ is created too, for the disc images; bios/ is not, since OrbisDir
-// falls back to the top folder only while there is no bios/ (older setups keep their BIOS there).
+// Most Wanted's recompiler crash. The missing files are merged in one at a time now: a tester's own files stay, nothing
+// is deleted, and a release switch in the top folder (the layout before vk-285-33, which OrbisFlag still reads) still
+// keeps the folder exactly as it is. games/ is created too, for the disc images; bios/ is not, since OrbisDir falls
+// back to the top folder only while there is no bios/ (older setups keep their BIOS there). Needs proper testing on a
+// console with a partial flags folder.
 static const char* const kOrbisReleaseFlags[] = {"fastmem", "jitdirect", "sw_renderer", "vk_16k", "vk_async",
                                                  "vk_deferflush", "vk_depthwait", "vk_fastpoll", "vk_gpuwait",
                                                  "vk_latewait", "vk_nocrumbs", "vk_noevict", "vk_renderer",
@@ -2382,17 +2403,12 @@ static void orbis_ensure_data_layout()
       entries += e->d_name[0] != '.' ? 1 : 0;
     closedir(d);
   }
-  if (entries > 0)
-  {
-    fflush(stdout);
-    return;
-  }
   for (const char* name : kOrbisReleaseFlags)
   {
     if (stat((std::string(kRoot) + "/" + name).c_str(), &st) == 0)
     {
       printf("[boot] data layout: flags/ is %s but %s/%s is there (the older layout): switch files left as they are\n",
-             have_dir ? "empty" : "missing", kRoot, name);
+             have_dir ? (entries == 0 ? "empty" : "partly populated") : "missing", kRoot, name);
       fflush(stdout);
       return;
     }
@@ -2403,22 +2419,41 @@ static void orbis_ensure_data_layout()
     fflush(stdout);
     return;
   }
-  int made = 0;
+  int added = 0, already = 0, failed = 0;
   for (const char* name : kOrbisReleaseFlags)
   {
-    const int fd = open((flags + "/" + name).c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0666);
+    const std::string path = flags + "/" + name;
+    if (stat(path.c_str(), &st) == 0)
+    {
+      already++;
+      continue;
+    }
+    const int fd = open(path.c_str(), O_WRONLY | O_CREAT | O_EXCL, 0666);
     if (fd >= 0)
     {
       close(fd);
-      made++;
+      added++;
+      printf("[boot] data layout: flags/%s added (a missing release switch)\n", name);
+    }
+    else if (errno == EEXIST)
+    {
+      already++;
+    }
+    else
+    {
+      failed++;
+      printf("[boot] data layout: flags/%s not added (errno %d)\n", name, errno);
     }
   }
-  const int total = static_cast<int>(sizeof(kOrbisReleaseFlags) / sizeof(kOrbisReleaseFlags[0]));
-  printf("[boot] data layout: flags/ was %s: wrote the release's switch files (%d of %d)\n", have_dir ? "empty" : "missing",
-         made, total);
-  fflush(stdout);
-  orbis_eventf("flags/ was %s: PS5SX2 wrote the release's %d switch files (as the installer does)",
-               have_dir ? "empty" : "missing", made);
+  if (added > 0 || failed > 0)
+  {
+    const int total = static_cast<int>(sizeof(kOrbisReleaseFlags) / sizeof(kOrbisReleaseFlags[0]));
+    printf("[boot] data layout: flags/: %d release switch files added, %d already present, %d failed (of %d)\n",
+           added, already, failed, total);
+    fflush(stdout);
+    if (added > 0)
+      orbis_eventf("flags/: PS5SX2 added %d missing release switch files; the files already there were kept", added);
+  }
 }
 
 // vk-285-115 (AI-assisted): PCSX2's Vulkan shader and pipeline caches renamed to *.bad after a GS device that didn't
@@ -3203,17 +3238,34 @@ int main()
     // on with the flag file fastmem.
 #ifdef ORBIS_PS4
     {
-      // PS4 port (AI-assisted): fastmem only when the kernel let the process alias direct memory (ps4_compat.cpp).
-      const bool fastmem = orbis_flag("fastmem") && g_orbis_ps4_dmem_aliasing;
+      // PS4 port (AI-assisted): fastmem is a major EE recompiler win on Jaguar, so it is on whenever the
+      // kernel let the process alias direct memory (ps4_compat.cpp). The flag file nofastmem opts out;
+      // fastmem stays accepted for the flag sets already in the field. Needs proper testing: this turns it
+      // on for consoles that had aliasing but no fastmem flag.
+      const bool fastmem_flag = orbis_flag("fastmem");
+      const bool nofastmem = orbis_flag("nofastmem");
+      const bool aliasing = g_orbis_ps4_dmem_aliasing != 0;
+      const bool fastmem = aliasing && !nofastmem;
+      const char* state = "on by default";
+      if (!aliasing)
+        state = "off (no direct memory aliasing)";
+      else if (nofastmem)
+        state = "off (nofastmem)";
       s_base_si.SetBoolValue("EmuCore/CPU/Recompiler", "EnableFastmem", fastmem);
-      printf("[boot] fastmem %s\n", fastmem ? "on (flag fastmem, direct memory aliasing on)"
-                                    : g_orbis_ps4_dmem_aliasing ? "off" : "off (no direct memory aliasing)");
+      printf("[boot] fastmem %s%s\n", state, fastmem && fastmem_flag ? " (flag fastmem present)" : "");
     }
 #else
     s_base_si.SetBoolValue("EmuCore/CPU/Recompiler", "EnableFastmem", orbis_flag("fastmem"));
     printf("[boot] fastmem %s\n", orbis_flag("fastmem") ? "on (flag fastmem)" : "off");
 #endif
     s_base_si.SetBoolValue("EmuCore/CPU/Recompiler", "EnableEECache", false);
+#ifdef ORBIS_PS4
+    // PS4 port (AI-assisted): PS5SX2's 130% EE clock recommendation costs host CPU the Jaguar doesn't
+    // have. Keep the base layer at 100%/no skip; gs.ini, a game's file and the GameDB can still override it.
+    // Needs proper testing in games whose PS5 recommendation assumed 130%.
+    s_base_si.SetIntValue("EmuCore/Speedhacks", "EECycleRate", 0);
+    s_base_si.SetIntValue("EmuCore/Speedhacks", "EECycleSkip", 0);
+#endif
     s_base_si.SetBoolValue("EmuCore/Speedhacks", "WaitLoop", true);
     s_base_si.SetBoolValue("EmuCore/Speedhacks", "IntcStat", true);
     s_base_si.SetBoolValue("EmuCore/Speedhacks", "vu1Instant", !g_no_speedhacks);
