@@ -1162,6 +1162,7 @@ static void orbis_output_default()
     ps5vk_output_restore_default();
 }
 
+#ifndef ORBIS_PS4
 // etaHEN non-whitelist jailbreak: send JAILBREAK_CMD to the legacy CMD server
 // (127.0.0.1:9028). Grants the process full ucred/caps (JIT, direct memory...).
 static void orbis_try_jailbreak()
@@ -1231,6 +1232,8 @@ static void orbis_try_jailbreak()
     printf("[jailbreak] all ports failed\n");
     fflush(stdout);
 }
+
+#endif
 
 extern "C" void orbis_stage(const char* stage)
 {
@@ -2828,10 +2831,11 @@ int main()
 #endif
   ORBIS_PS4_STEP("cover prefetch done");
 
+  extern bool orbis_probe_jit();
+#ifndef ORBIS_PS4
   // Primary: etaHEN/OnionHEN download0 file-broker jailbreak (needs PPSA99203
   // in the HEN app_jailbreak allowlist). Falls back to the legacy CMD ports.
   extern bool orbis_hen_jailbreak();
-  extern bool orbis_probe_jit();
   extern void orbis_log_hen_config();
   orbis_log_hen_config();
   ORBIS_PS4_STEP("HEN config logged");
@@ -2839,7 +2843,7 @@ int main()
     g_jailbreak_ok = 1;
   else
     orbis_try_jailbreak();
-  ORBIS_PS4_STEP("jailbreak step done");
+#endif
 #ifdef ORBIS_VULKAN
   orbis_log_flag_access("after the jailbreak");
 #endif
