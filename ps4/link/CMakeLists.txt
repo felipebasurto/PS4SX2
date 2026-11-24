@@ -95,6 +95,8 @@ endif ()
 target_link_libraries(pcsx2 PRIVATE
                       ${PS4_SYSROOT}/lib/libglslang.a
                       ${PS4_SYSROOT}/lib/libglslang-default-resource-limits.a
-                      z SceSysmodule SceSystemService SceUserService SceVideoOut SceAudioOut ScePad SceNet SceNetCtl
+                      ${PS4_SYSROOT}/lib/libz.a
+                      ${PS4_SYSROOT}/lib/libsmb2.a
+                      SceSysmodule SceSystemService SceUserService SceVideoOut SceAudioOut ScePad SceNet SceNetCtl
                       SceRandom SceSsl SceHttp SceImeDialog SceCommonDialog SceMouse SceKeyboard pthread)
 ps4_add_eboot(pcsx2)

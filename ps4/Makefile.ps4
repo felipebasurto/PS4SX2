@@ -106,6 +106,7 @@ RYML_SRCS := $(RYML)/src/c4/yml/common.cpp \
   $(RYML)/src/c4/yml/node_type.cpp \
   $(RYML)/src/c4/yml/parse.cpp \
   $(RYML)/src/c4/yml/reference_resolver.cpp \
+  $(RYML)/src/c4/yml/detail/known_keys.cpp \
   $(RYML)/src/c4/yml/scalar_style.cpp \
   $(RYML)/src/c4/yml/tag.cpp \
   $(RYML)/src/c4/yml/tree.cpp \
